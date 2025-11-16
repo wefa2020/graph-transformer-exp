@@ -131,7 +131,7 @@ class NeptuneDataExtractor:
     
     def extract_package_edges(self, package_id: str) -> Dict:
         """
-        Step 2 & 3: Extract all edges for a package and validate time fields
+        Extract all edges for a package including Problem and Missort
         Returns None if package is invalid
         """
         gremlin_client = self.get_client()
@@ -206,6 +206,32 @@ class NeptuneDataExtractor:
             result_set = gremlin_client.submit(linehaul_query)
             linehaul_edges = result_set.all().result()
             
+            # ✅ Get Problem edges
+            problem_query = f"""
+            g.V()
+             .has('Package', 'id', '{escaped_id}')
+             .outE('Problem')
+             .project('edge', 'sort_center')
+             .by(elementMap())
+             .by(inV().values('id'))
+            """
+            
+            result_set = gremlin_client.submit(problem_query)
+            problem_edges = result_set.all().result()
+            
+            # ✅ Get Missort edges
+            missort_query = f"""
+            g.V()
+             .has('Package', 'id', '{escaped_id}')
+             .outE('Missort')
+             .project('edge', 'sort_center')
+             .by(elementMap())
+             .by(inV().values('id'))
+            """
+            
+            result_set = gremlin_client.submit(missort_query)
+            missort_edges = result_set.all().result()
+            
             # Get Delivery edge
             delivery_query = f"""
             g.V()
@@ -219,6 +245,30 @@ class NeptuneDataExtractor:
             result_set = gremlin_client.submit(delivery_query)
             delivery_edges = result_set.all().result()
             
+            # ✅ Build lookup dictionaries for Problem and Missort
+            # Key: (sort_center, event_time_range) -> problem/missort data
+            problems_by_sc = defaultdict(list)
+            missorts_by_sc = defaultdict(set)
+            
+            for edge_data in problem_edges:
+                edge = edge_data['edge']
+                event_time = edge.get('event_time')
+                if event_time:
+                    problems_by_sc[edge_data['sort_center']].append({
+                        'event_time': event_time,
+                        'container_problems': edge.get('container_problems', '')
+                    })
+            
+            # Sort problems by time for each sort center
+            for sc in problems_by_sc:
+                problems_by_sc[sc].sort(key=lambda x: x['event_time'])
+            
+            for edge_data in missort_edges:
+                edge = edge_data['edge']
+                event_time = edge.get('event_time')
+                if event_time:
+                    missorts_by_sc[edge_data['sort_center']].add(event_time)
+            
             # Process Induct edges
             for edge_data in induct_edges:
                 edge = edge_data['edge']
@@ -229,16 +279,22 @@ class NeptuneDataExtractor:
                         self.invalid_packages['missing_time'].add(package_id)
                     return None
                 
+                sort_center = edge_data['sort_center']
+                
+                # ✅ Check for missort at same sort center
+                has_missort = sort_center in missorts_by_sc and len(missorts_by_sc[sort_center]) > 0
+                
                 package_data['events'].append({
                     'event_type': 'INDUCT',
-                    'sort_center': edge_data['sort_center'],
+                    'sort_center': sort_center,
                     'event_time': event_time,
                     'plan_time': edge.get('plan_time'),
                     'cpt': edge.get('cpt'),
                     'leg_type': edge.get('leg_type'),
                     'carrier_id': edge.get('carrier_id'),
                     'load_id': edge.get('load_id'),
-                    'ship_method': edge.get('ship_method')
+                    'ship_method': edge.get('ship_method'),
+                    'missort': has_missort  # ✅ Add missort flag
                 })
             
             # Process Exit202 edges
@@ -251,13 +307,28 @@ class NeptuneDataExtractor:
                         self.invalid_packages['missing_time'].add(package_id)
                     return None
                 
+                sort_center = edge_data['sort_center']
+                
+                # ✅ Find last problem before this exit event
+                problem_info = None
+                if sort_center in problems_by_sc:
+                    # Get all problems before or at this exit time
+                    relevant_problems = [
+                        p for p in problems_by_sc[sort_center]
+                        if p['event_time'] <= event_time
+                    ]
+                    if relevant_problems:
+                        # Get the last one
+                        problem_info = relevant_problems[-1]['container_problems']
+                
                 package_data['events'].append({
                     'event_type': 'EXIT',
-                    'sort_center': edge_data['sort_center'],
+                    'sort_center': sort_center,
                     'event_time': event_time,
                     'dwelling_seconds': edge.get('dwelling_seconds'),
                     'leg_type': edge.get('leg_type'),
-                    'carrier_id': edge.get('carrier_id')
+                    'carrier_id': edge.get('carrier_id'),
+                    'problem': problem_info  # ✅ Add problem info
                 })
             
             # Process LineHaul edges
@@ -270,15 +341,21 @@ class NeptuneDataExtractor:
                         self.invalid_packages['missing_time'].add(package_id)
                     return None
                 
+                sort_center = edge_data['sort_center']
+                
+                # ✅ Check for missort at same sort center
+                has_missort = sort_center in missorts_by_sc and len(missorts_by_sc[sort_center]) > 0
+                
                 package_data['events'].append({
                     'event_type': 'LINEHAUL',
-                    'sort_center': edge_data['sort_center'],
+                    'sort_center': sort_center,
                     'event_time': event_time,
                     'plan_time': edge.get('plan_time'),
                     'cpt': edge.get('cpt'),
                     'leg_type': edge.get('leg_type'),
                     'carrier_id': edge.get('carrier_id'),
-                    'ship_method': edge.get('ship_method')
+                    'ship_method': edge.get('ship_method'),
+                    'missort': has_missort  # ✅ Add missort flag
                 })
             
             # Process Delivery edge
@@ -609,7 +686,7 @@ class NeptuneDataExtractor:
         
         return df
     
-    def load_from_json(self, json_path: str, output_dir: str = 'data/graph-data') -> pd.DataFrame:
+    def load_from_json(self, json_path: str, output_dir: str = '/home/ubuntu/graph-transformer-exp/data/graph-data') -> pd.DataFrame:
         """Load extracted data from JSON file"""
         
         with open(f"{output_dir}/{json_path}", 'r') as f:
@@ -646,7 +723,7 @@ if __name__ == "__main__":
     # Configuration
     NEPTUNE_ENDPOINT = "swa-shipgraph-neptune-instance-prod-us-east-1.c6fskces27nt.us-east-1.neptune.amazonaws.com:8182"
     START_DATE = "2025-11-01T08:00:00Z"
-    END_DATE = "2025-11-02T10:10:59Z"
+    END_DATE = "2025-11-01T14:10:59Z"
     
     # Initialize extractor
     extractor = NeptuneDataExtractor(
@@ -669,6 +746,17 @@ if __name__ == "__main__":
             print("\nSample data:")
             print(df.head())
             print(f"\nColumns: {df.columns.tolist()}")
+            
+            # Print sample event with missort/problem info
+            if len(df) > 0:
+                sample_events = df.iloc[0]['events']
+                print("\nSample events with missort/problem info:")
+                for event in sample_events[:3]:
+                    print(f"  {event['event_type']} at {event.get('sort_center', 'N/A')}")
+                    if 'missort' in event:
+                        print(f"    - Missort: {event['missort']}")
+                    if 'problem' in event:
+                        print(f"    - Problem: {event['problem']}")
         
     except KeyboardInterrupt:
         print("\n\nExtraction interrupted by user")
