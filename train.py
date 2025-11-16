@@ -63,8 +63,8 @@ def create_dataloaders(config):
     print("="*80)
     
     #query = extractor.extract_lifecycles(
-    #    start_date='2025-11-01T08:00:00Z',
-    #    end_date='2025-11-08T08:00:00Z'
+    #    start_date='2025-11-01T00:00:00Z',
+    #    end_date='2025-11-08T23:59:59Z'
     #)
     
     print("Execute this query in Neptune and save results to 'package_lifecycles.json'")
@@ -76,7 +76,7 @@ def create_dataloaders(config):
     print("STEP 2: Load extracted data")
     print("="*80)
     
-    df = extractor.load_from_json('package_lifecycles.json') 
+    df = extractor.load_from_json('source.json') 
     print(f"Loaded {len(df)} package lifecycles")
     
     # Split data

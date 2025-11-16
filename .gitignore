@@ -49,6 +49,7 @@ data/processed/*.csv
 *.parquet
 *.csv
 *.json.gz
+*.json
 
 # Keep only small example files
 !data/sample/
