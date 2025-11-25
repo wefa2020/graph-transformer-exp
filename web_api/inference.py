@@ -8,9 +8,8 @@ import copy
 
 from config import Config
 from models.event_predictor import EventTimePredictor
-from data.dataset import PackageLifecycleDataset, collate_fn
+from data.data_preprocessor import PackageLifecycleDataset, collate_fn
 from data.neptune_extractor import NeptuneDataExtractor
-from data.data_preprocessor import PackageLifecyclePreprocessor
 
 class DateTimeEncoder(json.JSONEncoder):
     """Custom JSON encoder for datetime objects"""
@@ -627,30 +626,12 @@ def main():
     # ============================================================================
     # CONFIGURE PACKAGE IDs HERE
     # ============================================================================
-    #  "TBA325664407961",
-    #     "TBA325671393305",
-    #     "TBA325694416401",
-    #     "TBA325716777454",
-    #     "TBA325683690446",
-    #     "TBA325684653809",
-    #     "TBA325452020989",
-    #     "9361289768756275475209",
-    #     "TBA325678810142",
-    #     "TBA325666970614",
-    #     "9361289768755959876011",
-    #     "TBA325690809267",
-    #     "9361289768756279450332"
     package_ids = [       
-       "TBA325136379051",
-        "TBA325136522364",
-        "TBA325136422852",
-        "TBA325136522895",
-        "TBA325136430244"
-                        # Add more package IDs here
-            ]
-    # ============================================================================
-    
-    print("\n" + "="*80)
+        "TBA325664407961",
+        "TBA325671393305",
+        "TBA325694416401"
+                # Add more package IDs here
+    ]
     # ============================================================================
     
     print("\n" + "="*80)

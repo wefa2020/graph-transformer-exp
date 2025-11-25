@@ -9,7 +9,8 @@ from collections import defaultdict
 import threading
 from tqdm import tqdm
 import time
-
+from utils.package_filter import PackageEventValidator
+  
 class NeptuneDataExtractor:
     """Extract package lifecycle data from Neptune using Gremlin Client with batch processing"""
     
@@ -691,8 +692,11 @@ class NeptuneDataExtractor:
         
         with open(f"{output_dir}/{json_path}", 'r') as f:
             data = json.load(f)
-        
-        return pd.DataFrame(data)
+
+        validator = PackageEventValidator(max_time_vs_plan_hours=8.0, min_linehaul_exit_minutes=5.0)
+        result = validator.filter_packages(data, verbose=True)
+
+        return pd.DataFrame(result['valid_packages'])
     
     def close(self):
         """Close all connections"""
