@@ -15,6 +15,7 @@ from data.data_preprocessor import PackageLifecyclePreprocessor
 from data.dataset import PackageLifecycleDataset, collate_fn
 from models.event_predictor import EventTimePredictor
 from utils.metrics import compute_metrics, EarlyStopping
+from utils.package_filter import PackageEventValidator
 
 def exclude_last_nodes(preds, batch_vector):
     """
@@ -152,7 +153,7 @@ def create_dataloaders(config):
     
     return train_loader, val_loader, test_loader, preprocessor
 
-def train_epoch(model, loader, optimizer, criterion, device, scaler=None):
+def train_epoch(model, loader, optimizer, criterion, device, preprocessor, scaler=None):
     """Train for one epoch"""
     model.train()
     
@@ -213,13 +214,14 @@ def train_epoch(model, loader, optimizer, criterion, device, scaler=None):
     all_preds = torch.cat(all_preds, dim=0).numpy()
     all_targets = torch.cat(all_targets, dim=0).numpy()
     
-    metrics = compute_metrics(all_preds, all_targets)
+    # ✅ Compute metrics with inverse transform
+    metrics = compute_metrics(all_preds, all_targets, preprocessor=preprocessor)
     metrics['loss'] = avg_loss
     
     return metrics
 
 @torch.no_grad()
-def validate(model, loader, criterion, device):
+def validate(model, loader, criterion, device, preprocessor):
     """Validate model"""
     model.eval()
     
@@ -255,7 +257,8 @@ def validate(model, loader, criterion, device):
     all_preds = torch.cat(all_preds, dim=0).numpy()
     all_targets = torch.cat(all_targets, dim=0).numpy()
     
-    metrics = compute_metrics(all_preds, all_targets)
+    # ✅ Compute metrics with inverse transform
+    metrics = compute_metrics(all_preds, all_targets, preprocessor=preprocessor)
     metrics['loss'] = avg_loss
     
     return metrics
@@ -324,16 +327,16 @@ def main():
         print(f"\nEpoch {epoch+1}/{config.training.num_epochs}")
         
         # Train
-        train_metrics = train_epoch(model, train_loader, optimizer, criterion, device, scaler)
+        train_metrics = train_epoch(model, train_loader, optimizer, criterion, device, preprocessor, scaler)
         
         # Validate
-        val_metrics = validate(model, val_loader, criterion, device)
+        val_metrics = validate(model, val_loader, criterion, device, preprocessor)
         
         # Update scheduler
         if config.training.scheduler_type != 'onecycle':
             scheduler.step()
         
-        # Log metrics
+        # Log metrics (both scaled and inverted)
         for key, value in train_metrics.items():
             writer.add_scalar(f'train/{key}', value, epoch)
         for key, value in val_metrics.items():
@@ -341,9 +344,13 @@ def main():
         
         writer.add_scalar('lr', optimizer.param_groups[0]['lr'], epoch)
         
-        # Print metrics
-        print(f"Train Loss: {train_metrics['loss']:.4f}, MAE: {train_metrics['mae']:.4f}, RMSE: {train_metrics['rmse']:.4f}")
-        print(f"Val Loss: {val_metrics['loss']:.4f}, MAE: {val_metrics['mae']:.4f}, RMSE: {val_metrics['rmse']:.4f}")
+        # ✅ Print metrics with both scaled and inverted values
+        print(f"Train Loss: {train_metrics['loss']:.4f}, "
+              f"MAE: {train_metrics['mae']:.4f} (scaled) / {train_metrics['mae_hours']:.4f} hrs, "
+              f"RMSE: {train_metrics['rmse']:.4f} (scaled) / {train_metrics['rmse_hours']:.4f} hrs")
+        print(f"Val Loss: {val_metrics['loss']:.4f}, "
+              f"MAE: {val_metrics['mae']:.4f} (scaled) / {val_metrics['mae_hours']:.4f} hrs, "
+              f"RMSE: {val_metrics['rmse']:.4f} (scaled) / {val_metrics['rmse_hours']:.4f} hrs")
         
         # Save best model
         if val_metrics['loss'] < best_val_loss:
@@ -382,11 +389,12 @@ def main():
     checkpoint = torch.load(os.path.join(config.training.save_dir, 'best_model.pt'))
     model.load_state_dict(checkpoint['model_state_dict'])
     
-    test_metrics = validate(model, test_loader, criterion, device)
+    test_metrics = validate(model, test_loader, criterion, device, preprocessor)
     
+    # ✅ Print test metrics with both scaled and inverted values
     print(f"Test Loss: {test_metrics['loss']:.4f}")
-    print(f"Test MAE: {test_metrics['mae']:.4f}")
-    print(f"Test RMSE: {test_metrics['rmse']:.4f}")
+    print(f"Test MAE: {test_metrics['mae']:.4f} (scaled) / {test_metrics['mae_hours']:.4f} hours")
+    print(f"Test RMSE: {test_metrics['rmse']:.4f} (scaled) / {test_metrics['rmse_hours']:.4f} hours")
     print(f"Test MAPE: {test_metrics['mape']:.2f}%")
     print(f"Test R²: {test_metrics['r2']:.4f}")
     

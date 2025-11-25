@@ -46,7 +46,7 @@ class ModelConfig:
     hidden_dim: int = 256
     
     # Graph Transformer
-    num_layers: int = 40
+    num_layers: int = 20
     num_heads: int = 8
     dropout: float = 0.1
     
@@ -60,7 +60,7 @@ class ModelConfig:
 @dataclass
 class TrainingConfig:
     """Training configuration"""
-    batch_size: int = 128
+    batch_size: int = 64
     num_epochs: int = 100
     learning_rate: float = 1e-4
     weight_decay: float = 1e-5
