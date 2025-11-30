@@ -15,10 +15,11 @@ class PackageEventValidator:
     
     Validation Rules:
     1. All events must have valid event_time
-    2. Within each sort center, EXIT must come after INDUCT/LINEHAUL
-    3. If EXIT follows LINEHAUL, time difference must be >= 5 minutes
-    4. Each sort center must have exactly one INDUCT/LINEHAUL and one EXIT
-    5. At each event, abs(event_time - plan_time) must be <= 7 hours
+    2. leg_type must be 'FORWARD' for all non-DELIVERY events
+    3. Within each sort center, EXIT must come after INDUCT/LINEHAUL
+    4. If EXIT follows LINEHAUL, time difference must be >= 5 minutes
+    5. Each sort center must have exactly one INDUCT/LINEHAUL and one EXIT
+    6. At each event, abs(event_time - plan_time) must be <= 7 hours
     
     Preprocessing:
     - Events are sorted by sort center and time
@@ -43,6 +44,7 @@ class PackageEventValidator:
         # Statistics tracking
         self.stats = {
             'invalid_event_time': 0,
+            'invalid_leg_type': 0,
             'exit_before_induct_linehaul': 0,
             'linehaul_exit_too_close': 0,
             'invalid_sort_center_structure': 0,
@@ -161,7 +163,10 @@ class PackageEventValidator:
                 )
             event['_parsed_time'] = event_time
         
-        # STEP 2: Group events by sort center
+        # STEP 2: Validate leg_type for all non-DELIVERY events
+        self._validate_leg_type(events)
+        
+        # STEP 3: Group events by sort center
         sort_center_events = {}
         
         for event in events:
@@ -182,44 +187,78 @@ class PackageEventValidator:
             
             sort_center_events[sc_key].append(event)
         
-        # STEP 3: Sort events within each sort center by event_time
+        # STEP 4: Sort events within each sort center by event_time
         for sc_key in sort_center_events:
             sort_center_events[sc_key].sort(key=lambda e: e['_parsed_time'])
         
-        # STEP 4: Validate sort center structure
+        # STEP 5: Validate sort center structure
         self._validate_sort_center_structure(sort_center_events)
         
-        # STEP 5: Validate event sequences within sort centers
+        # STEP 6: Validate event sequences within sort centers
         self._validate_event_sequences_within_sc(sort_center_events)
         
-        # STEP 6: Order sort centers by their earliest event time
+        # STEP 7: Order sort centers by their earliest event time
         sort_center_order = sorted(
             sort_center_events.keys(),
             key=lambda sc: sort_center_events[sc][0]['_parsed_time']
         )
         
-        # STEP 7: Reconstruct sorted event list
+        # STEP 8: Reconstruct sorted event list
         sorted_events = []
         for sc_key in sort_center_order:
             sorted_events.extend(sort_center_events[sc_key])
         
-        # STEP 8: Validate global event sequence
+        # STEP 9: Validate global event sequence
         self._validate_global_event_sequence(sorted_events)
         
-        # STEP 9: Validate time vs plan
+        # STEP 10: Validate time vs plan
         self._validate_time_vs_plan(sorted_events)
         
-        # STEP 10: Clean up temporary parsed time field
+        # STEP 11: Clean up temporary parsed time field
         for event in sorted_events:
             del event['_parsed_time']
         
-        # STEP 11: Create copies and move problems
+        # STEP 12: Create copies and move problems
         processed_events = self._move_exit_problems_to_prev(sorted_events)
         
-        # STEP 12: Add next_plan_time to each event
+        # STEP 13: Add next_plan_time to each event
         processed_events = self._add_next_plan_time(processed_events)
         
         return processed_events
+    
+    def _validate_leg_type(self, events: List[Dict]):
+        """
+        Validate that leg_type is 'FORWARD' for all non-DELIVERY events
+        
+        Args:
+            events: List of event dictionaries
+            
+        Raises:
+            ValueError: If leg_type is not 'FORWARD'
+        """
+        for i, event in enumerate(events):
+            event_type = event.get('event_type')
+            
+            # Skip DELIVERY events - they may not have leg_type
+            if event_type == 'DELIVERY':
+                continue
+            
+            leg_type = event.get('leg_type')
+            
+            # Check if leg_type exists and is FORWARD
+            if leg_type is None or leg_type == 'null' or str(leg_type).strip() == '':
+                raise ValueError(
+                    f"Missing leg_type in event {i} (type: {event_type}). "
+                    f"All non-DELIVERY events must have leg_type='FORWARD'. "
+                    f"Package has invalid leg_type."
+                )
+            
+            if str(leg_type).upper() != 'FORWARD':
+                raise ValueError(
+                    f"Invalid leg_type '{leg_type}' in event {i} (type: {event_type}). "
+                    f"Expected 'FORWARD'. Package has non-forward leg_type. "
+                    f"Only forward direction packages are supported."
+                )
     
     def _validate_sort_center_structure(self, sort_center_events: Dict[str, List[Dict]]):
         """
@@ -460,6 +499,8 @@ class PackageEventValidator:
         """
         if 'Invalid or missing event_time' in error_msg:
             return 'invalid_event_time'
+        elif 'leg_type' in error_msg.lower():
+            return 'invalid_leg_type'
         elif 'EXIT event at' in error_msg and 'is not after all INDUCT/LINEHAUL' in error_msg:
             return 'exit_before_induct_linehaul'
         elif 'EXIT event follows LINEHAUL' in error_msg and 'minutes gap' in error_msg:
@@ -594,6 +635,7 @@ class PackageEventValidator:
         
         print(f"\nFiltering reasons:")
         print(f"  - Invalid event time: {self.stats['invalid_event_time']}")
+        print(f"  - Invalid leg_type (not FORWARD): {self.stats['invalid_leg_type']}")
         print(f"  - EXIT before INDUCT/LINEHAUL: {self.stats['exit_before_induct_linehaul']}")
         print(f"  - LINEHAUL-EXIT < {self.min_linehaul_exit_minutes} min: {self.stats['linehaul_exit_too_close']}")
         print(f"  - Invalid sort center structure: {self.stats['invalid_sort_center_structure']}")
@@ -615,6 +657,7 @@ class PackageEventValidator:
         """
         error_categories = [
             'invalid_event_time',
+            'invalid_leg_type',
             'exit_before_induct_linehaul',
             'linehaul_exit_too_close',
             'invalid_sort_center_structure',
@@ -637,9 +680,9 @@ class PackageEventValidator:
 
 # Example usage
 if __name__ == "__main__":
-    # Example 1: Basic usage with next_plan_time
+    # Example 1: Basic usage with next_plan_time and leg_type validation
     print("="*60)
-    print("Example 1: Basic usage with next_plan_time")
+    print("Example 1: Basic usage with leg_type validation")
     print("="*60)
     
     sample_packages = [
@@ -653,13 +696,15 @@ if __name__ == "__main__":
                     'plan_time': '2024-01-01T10:00:00Z',
                     'cpt': '2024-01-01T11:00:00Z',
                     'sort_center': 'SC1',
-                    'carrier_id': 'C1'
+                    'carrier_id': 'C1',
+                    'leg_type': 'FORWARD'
                 },
                 {
                     'event_type': 'EXIT',
                     'event_time': '2024-01-01T11:00:00Z',
                     'sort_center': 'SC1',
-                    'carrier_id': 'C1'
+                    'carrier_id': 'C1',
+                    'leg_type': 'FORWARD'
                 },
                 {
                     'event_type': 'LINEHAUL',
@@ -667,13 +712,15 @@ if __name__ == "__main__":
                     'plan_time': '2024-01-01T12:00:00Z',
                     'cpt': '2024-01-01T14:00:00Z',
                     'sort_center': 'SC2',
-                    'carrier_id': 'C1'
+                    'carrier_id': 'C1',
+                    'leg_type': 'FORWARD'
                 },
                 {
                     'event_type': 'EXIT',
                     'event_time': '2024-01-01T14:30:00Z',
                     'sort_center': 'SC2',
-                    'carrier_id': 'C1'
+                    'carrier_id': 'C1',
+                    'leg_type': 'FORWARD'
                 },
                 {
                     'event_type': 'DELIVERY',
@@ -692,12 +739,34 @@ if __name__ == "__main__":
                     'event_time': '2024-01-01T10:00:00Z',
                     'plan_time': '2024-01-01T10:00:00Z',
                     'cpt': '2024-01-01T11:00:00Z',
-                    'sort_center': 'SC1'
+                    'sort_center': 'SC1',
+                    'leg_type': 'BACKWARD'  # Invalid: should be FORWARD
                 },
                 {
                     'event_type': 'EXIT',
-                    'event_time': '2024-01-01T09:00:00Z',  # Invalid: EXIT before INDUCT
+                    'event_time': '2024-01-01T11:00:00Z',
+                    'sort_center': 'SC1',
+                    'leg_type': 'FORWARD'
+                }
+            ]
+        },
+        {
+            'package_id': 'PKG003',
+            'weight': 8.0,
+            'events': [
+                {
+                    'event_type': 'INDUCT',
+                    'event_time': '2024-01-01T10:00:00Z',
+                    'plan_time': '2024-01-01T10:00:00Z',
+                    'cpt': '2024-01-01T11:00:00Z',
                     'sort_center': 'SC1'
+                    # Missing leg_type
+                },
+                {
+                    'event_type': 'EXIT',
+                    'event_time': '2024-01-01T11:00:00Z',
+                    'sort_center': 'SC1',
+                    'leg_type': 'FORWARD'
                 }
             ]
         }
@@ -720,10 +789,12 @@ if __name__ == "__main__":
             print(f"      - event_time: {event.get('event_time')}")
             print(f"      - plan_time: {event.get('plan_time')}")
             print(f"      - cpt: {event.get('cpt')}")
+            print(f"      - leg_type: {event.get('leg_type')}")
             print(f"      - next_plan_time: {event.get('next_plan_time')}")
     
     for pkg in result['invalid_packages']:
         print(f"  ✗ Invalid: {pkg['package_id']} - {pkg['error_category']}")
+        print(f"    Error: {pkg['error_message'][:100]}...")
     
     # Example 2: Using with DataFrame
     print("\n" + "="*60)

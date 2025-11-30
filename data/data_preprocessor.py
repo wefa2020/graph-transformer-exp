@@ -19,10 +19,12 @@ class PackageLifecyclePreprocessor:
         self.ship_method_encoder = LabelEncoder()
         self.location_encoder = LabelEncoder()
         
-        self.time_scaler = StandardScaler()
+        self.time_scaler = StandardScaler()  # Now scales TRANSIT TIMES (event gaps)
         self.package_feature_scaler = StandardScaler()
         self.plan_time_diff_scaler = StandardScaler()
-        self.edge_time_diff_scaler = StandardScaler()  # For edge features
+        self.planned_remaining_scaler = StandardScaler()  # For node feature
+        self.planned_duration_scaler = StandardScaler()   # For node feature
+        self.planned_transit_scaler = StandardScaler()    # NEW: For planned transit time
         
         self.event_types = config.data.event_types
         self.problem_types = config.data.problem_types
@@ -108,232 +110,6 @@ class PackageLifecyclePreprocessor:
                 return None
         
         return None
-    
-    def _preprocess_events(self, events: List[Dict]) -> List[Dict]:
-        """
-        Preprocess events with sorting, validation, and problem field movement
-        
-        Sorting logic:
-        1. Group events by sort center (DELIVERY events use "DELIVERY" as their group key)
-        2. Order sort centers by their earliest event time (ascending)
-        3. Within each sort center, sort events by event_time (ascending)
-        
-        Validation rules:
-        1. Within each sort center, EXIT time must be greater than INDUCT/LINEHAUL time
-        2. If EXIT follows LINEHAUL, time difference must be >= 5 minutes
-        3. Each sort center must have exactly one INDUCT/LINEHAUL and exactly one EXIT
-        4. At each event, abs(event_time - plan_time) must be <= 7 hours
-        
-        Args:
-            events: List of event dictionaries
-            
-        Returns:
-            Modified list of events with proper ordering and problems moved to previous nodes
-            
-        Raises:
-            ValueError: If validation rules are violated
-        """
-        if not events:
-            return []
-        
-        # STEP 1: Parse and validate all event times
-        for event in events:
-            event_time = self._parse_datetime(event.get('event_time'))
-            if event_time is None:
-                raise ValueError(
-                    f"Invalid or missing event_time in event: {event.get('event_type', 'UNKNOWN')} "
-                    f"at sort_center: {event.get('sort_center', 'UNKNOWN')}"
-                )
-            event['_parsed_time'] = event_time
-        
-        # STEP 2: Group events by sort center
-        sort_center_events = {}
-        
-        for event in events:
-            event_type = event.get('event_type')
-            
-            # DELIVERY events don't have sort_center field - use "DELIVERY" as key
-            if event_type == 'DELIVERY':
-                sc_key = 'DELIVERY'
-            else:
-                sort_center = event.get('sort_center')
-                
-                # Handle None or 'null' sort centers
-                if not sort_center or sort_center == 'null':
-                    sc_key = 'UNKNOWN'
-                else:
-                    sc_key = str(sort_center)
-            
-            if sc_key not in sort_center_events:
-                sort_center_events[sc_key] = []
-            
-            sort_center_events[sc_key].append(event)
-        
-        # STEP 3: Sort events within each sort center by event_time
-        for sc_key in sort_center_events:
-            sort_center_events[sc_key].sort(key=lambda e: e['_parsed_time'])
-        
-        # STEP 3.3: VALIDATION RULE 3 - Each sort center must have exactly one INDUCT/LINEHAUL and one EXIT
-        for sc_key, sc_events in sort_center_events.items():
-            # Skip DELIVERY and UNKNOWN groups (they don't have this requirement)
-            if sc_key in ['DELIVERY', 'UNKNOWN']:
-                continue
-            
-            # Count INDUCT/LINEHAUL and EXIT events
-            induct_linehaul_count = 0
-            exit_count = 0
-            
-            for event in sc_events:
-                event_type = event.get('event_type')
-                if event_type in ['INDUCT', 'LINEHAUL']:
-                    induct_linehaul_count += 1
-                elif event_type == 'EXIT':
-                    exit_count += 1
-            
-            # Validate counts
-            if induct_linehaul_count != 1:
-                raise ValueError(
-                    f"Invalid sort center structure at '{sc_key}': "
-                    f"Found {induct_linehaul_count} INDUCT/LINEHAUL events, expected exactly 1. "
-                    f"Package has invalid event structure."
-                )
-            
-            if exit_count != 1:
-                raise ValueError(
-                    f"Invalid sort center structure at '{sc_key}': "
-                    f"Found {exit_count} EXIT events, expected exactly 1. "
-                    f"Package has invalid event structure."
-                )
-        
-        # STEP 3.5: VALIDATION RULE 1 - Within each sort center, EXIT must come after INDUCT/LINEHAUL
-        for sc_key, sc_events in sort_center_events.items():
-            # Skip DELIVERY and UNKNOWN groups
-            if sc_key in ['DELIVERY', 'UNKNOWN']:
-                continue
-            
-            # Find INDUCT/LINEHAUL and EXIT events
-            induct_linehaul_times = []
-            exit_times = []
-            
-            for event in sc_events:
-                event_type = event.get('event_type')
-                if event_type in ['INDUCT', 'LINEHAUL']:
-                    induct_linehaul_times.append(event['_parsed_time'])
-                elif event_type == 'EXIT':
-                    exit_times.append(event['_parsed_time'])
-            
-            # Check that all EXIT times are greater than all INDUCT/LINEHAUL times
-            if induct_linehaul_times and exit_times:
-                max_induct_linehaul_time = max(induct_linehaul_times)
-                min_exit_time = min(exit_times)
-                
-                if min_exit_time <= max_induct_linehaul_time:
-                    raise ValueError(
-                        f"Invalid event sequence at sort center '{sc_key}': "
-                        f"EXIT event at {min_exit_time} is not after all INDUCT/LINEHAUL events "
-                        f"(latest INDUCT/LINEHAUL at {max_induct_linehaul_time}). "
-                        f"Package has invalid event timing."
-                    )
-        
-        # STEP 4: Order sort centers by their earliest event time
-        sort_center_order = sorted(
-            sort_center_events.keys(),
-            key=lambda sc: sort_center_events[sc][0]['_parsed_time']  # First event (earliest) in each SC
-        )
-        
-        # STEP 5: Reconstruct sorted event list
-        sorted_events = []
-        for sc_key in sort_center_order:
-            sorted_events.extend(sort_center_events[sc_key])
-        
-        # STEP 5.5: VALIDATION RULE 2 - If EXIT follows LINEHAUL, time diff must be >= 5 minutes
-        for i in range(1, len(sorted_events)):
-            prev_event = sorted_events[i-1]
-            curr_event = sorted_events[i]
-            
-            prev_type = prev_event.get('event_type')
-            curr_type = curr_event.get('event_type')
-            
-            if prev_type == 'LINEHAUL' and curr_type == 'EXIT':
-                time_diff = (curr_event['_parsed_time'] - prev_event['_parsed_time']).total_seconds() / 60  # minutes
-                
-                if time_diff < 5:
-                    raise ValueError(
-                        f"Invalid event sequence: EXIT event follows LINEHAUL with only {time_diff:.2f} minutes gap "
-                        f"(minimum 5 minutes required). "
-                        f"LINEHAUL at {prev_event['_parsed_time']}, EXIT at {curr_event['_parsed_time']}. "
-                        f"Package has unrealistic timing."
-                    )
-        
-        # STEP 5.7: VALIDATION RULE 4 - Check abs(event_time - plan_time) <= 7 hours
-        for i, event in enumerate(sorted_events):
-            event_time = event['_parsed_time']
-            event_type = event.get('event_type')
-            
-            # Get appropriate plan_time
-            # For EXIT events, use previous event's CPT
-            if event_type == 'EXIT' and i > 0:
-                prev_event = sorted_events[i-1]
-                plan_time_value = prev_event.get('cpt')
-            else:
-                plan_time_value = event.get('plan_time')
-            
-            # Parse plan_time
-            plan_time = self._parse_datetime(plan_time_value)
-            
-            # Only validate if plan_time exists
-            if plan_time is not None:
-                time_diff_hours = abs((event_time - plan_time).total_seconds() / 3600)
-                
-                if time_diff_hours > 7:
-                    raise ValueError(
-                        f"Event time vs plan time difference too large at event {i} "
-                        f"(type: {event_type}): {time_diff_hours:.2f} hours "
-                        f"(maximum 7 hours allowed). "
-                        f"Event time: {event_time}, Plan time: {plan_time}. "
-                        f"Package has unrealistic delay or advancement."
-                    )
-        
-        # Clean up temporary parsed time field
-        for event in sorted_events:
-            del event['_parsed_time']
-        
-        # STEP 6: Create copies for processing
-        processed_events = []
-        for event in sorted_events:
-            event_copy = event.copy()
-            processed_events.append(event_copy)
-        
-        # STEP 7: Move problems from EXIT to previous event
-        for i, event in enumerate(processed_events):
-            if event['event_type'] == 'EXIT':
-                problem_value = event.get('problem')
-                problems = self._parse_problem_field(problem_value)
-                
-                if problems:  # Has problem
-                    # Must have a previous event
-                    if i == 0:
-                        raise ValueError(
-                            f"EXIT event at index {i} has problem {problems} but no previous event. "
-                            f"Package has invalid event sequence."
-                        )
-                    
-                    # Previous event must be INDUCT or LINEHAUL
-                    prev_event_type = processed_events[i-1]['event_type']
-                    if prev_event_type not in ['INDUCT', 'LINEHAUL']:
-                        raise ValueError(
-                            f"EXIT event at index {i} has problem {problems} but previous event "
-                            f"type is '{prev_event_type}'. Expected INDUCT or LINEHAUL. "
-                            f"Cannot assign problem to incompatible event type."
-                        )
-                    
-                    # Move problem to previous event
-                    processed_events[i-1]['problem'] = problem_value
-                    
-                    # Remove problem from EXIT event
-                    processed_events[i].pop('problem', None)
-
-        return processed_events        
     
     def _extract_route(self, events: List[Dict]) -> List[str]:
         """
@@ -585,39 +361,47 @@ class PackageLifecyclePreprocessor:
         print(f"  - Invalid sort center structure: {self.filter_stats['invalid_sort_center_structure']}")
         print(f"  - EXIT problem no prev event: {self.filter_stats['exit_problem_no_prev']}")
         print(f"  - EXIT problem invalid prev: {self.filter_stats['exit_problem_invalid_prev']}")
-        print(f"  - Event-Plan time diff > 7h: {self.filter_stats['event_plan_time_diff_too_large']}")
+        print(f"  - Event-Plan time diff > 24h: {self.filter_stats['event_plan_time_diff_too_large']}")
         print(f"{'='*60}\n")
     
-        # Fit time scaler
-        time_deltas = []
+        # ====================================================================
+        # FIT TIME SCALER (TARGET) - TRANSIT TIMES BETWEEN EVENTS
+        # ====================================================================
+        transit_times = []
         for _, row in df.iterrows():
-            try:
-                events = self._preprocess_events(row['events'])
-            except ValueError:
-                continue
-                
-            for i in range(1, len(events)):
+            events = row['events']
+            for i in range(len(events) - 1):
                 try:
-                    prev_time = self._parse_datetime(events[i-1]['event_time'])
-                    curr_time = self._parse_datetime(events[i]['event_time'])
+                    # Current event time
+                    current_time = self._parse_datetime(events[i]['event_time'])
+                    # Next event time
+                    next_time = self._parse_datetime(events[i+1]['event_time'])
                     
-                    if prev_time and curr_time:
-                        delta = (curr_time - prev_time).total_seconds() / 3600
-                        time_deltas.append([delta])
+                    if current_time and next_time:
+                        # Transit time = next_time - current_time
+                        transit_hours = (next_time - current_time).total_seconds() / 3600
+                        if transit_hours >= 0:  # Only positive transit times
+                            transit_times.append([transit_hours])
                 except Exception as e:
                     continue
         
-        if time_deltas:
-            self.time_scaler.fit(np.array(time_deltas))
+        if transit_times:
+            self.time_scaler.fit(np.array(transit_times))
+            print(f"Fitted time_scaler (TARGET - TRANSIT TIME) on {len(transit_times)} samples")
+            print(f"  Mean: {np.mean(transit_times):.2f} hours")
+            print(f"  Std: {np.std(transit_times):.2f} hours")
+            print(f"  Min: {np.min(transit_times):.2f} hours")
+            print(f"  Max: {np.max(transit_times):.2f} hours")
+            print(f"  Median: {np.median(transit_times):.2f} hours")
+            print(f"  25th percentile: {np.percentile(transit_times, 25):.2f} hours")
+            print(f"  75th percentile: {np.percentile(transit_times, 75):.2f} hours")
+            print(f"  95th percentile: {np.percentile(transit_times, 95):.2f} hours")
+        # ====================================================================
         
         # Fit plan time difference scaler
         plan_time_diffs = []
         for _, row in df.iterrows():
-            try:
-                events = self._preprocess_events(row['events'])
-            except ValueError:
-                continue
-                
+            events = row['events']
             for i, event in enumerate(events):
                 # Get previous event for EXIT events
                 prev_event = events[i-1] if i > 0 else None
@@ -633,38 +417,108 @@ class PackageLifecyclePreprocessor:
         
         if plan_time_diffs:
             self.plan_time_diff_scaler.fit(np.array(plan_time_diffs))
-            print(f"Fitted plan_time_diff scaler on {len(plan_time_diffs)} samples")
+            print(f"\nFitted plan_time_diff scaler on {len(plan_time_diffs)} samples")
             print(f"  Mean: {np.mean(plan_time_diffs):.2f} hours")
             print(f"  Std: {np.std(plan_time_diffs):.2f} hours")
             print(f"  Min: {np.min(plan_time_diffs):.2f} hours")
             print(f"  Max: {np.max(plan_time_diffs):.2f} hours")
         
-        # Fit edge time difference scaler (next_plan_time - event_time)
-        edge_time_diffs = []
+        # Fit planned_remaining scaler (next_plan_time - current_event_time)
+        # This will be a NODE feature now
+        planned_remaining_times = []
         for _, row in df.iterrows():
-            try:
-                events = self._preprocess_events(row['events'])
-            except ValueError:
-                continue
+            events = row['events']
+            for i in range(len(events) - 1):
+                # Get current event time
+                current_event_time = self._parse_datetime(events[i].get('event_time'))
                 
-            for event in events:
-                next_plan_time = event.get('next_plan_time')
-                event_time = event.get('event_time')
-                
-                # Calculate next_plan_time - event_time
-                diff = self._calculate_time_vs_plan(
-                    next_plan_time,
-                    event_time
+                # Get plan_time for next node (node i+1)
+                next_plan_time = self._parse_datetime(
+                    self._get_plan_time_for_event(events[i+1], events[i])
                 )
-                edge_time_diffs.append([diff])
+                
+                # Calculate: next_plan_time - current_event_time
+                if current_event_time is not None and next_plan_time is not None:
+                    diff = (next_plan_time - current_event_time).total_seconds() / 3600
+                    planned_remaining_times.append([diff])
+                else:
+                    planned_remaining_times.append([0.0])
         
-        if edge_time_diffs:
-            self.edge_time_diff_scaler.fit(np.array(edge_time_diffs))
-            print(f"\nFitted edge_time_diff scaler on {len(edge_time_diffs)} samples")
-            print(f"  Mean: {np.mean(edge_time_diffs):.2f} hours")
-            print(f"  Std: {np.std(edge_time_diffs):.2f} hours")
-            print(f"  Min: {np.min(edge_time_diffs):.2f} hours")
-            print(f"  Max: {np.max(edge_time_diffs):.2f} hours")
+        if planned_remaining_times:
+            self.planned_remaining_scaler.fit(np.array(planned_remaining_times))
+            print(f"\nFitted planned_remaining scaler on {len(planned_remaining_times)} samples")
+            print(f"  Mean: {np.mean(planned_remaining_times):.2f} hours")
+            print(f"  Std: {np.std(planned_remaining_times):.2f} hours")
+            print(f"  Min: {np.min(planned_remaining_times):.2f} hours")
+            print(f"  Max: {np.max(planned_remaining_times):.2f} hours")
+        
+        # Fit planned duration scaler (next_plan_time - current_plan_time)
+        # This will be a NODE feature now
+        planned_durations = []
+        for _, row in df.iterrows():
+            events = row['events']
+            for i in range(len(events) - 1):
+                # Get plan_time for current node
+                current_plan_time = self._parse_datetime(
+                    self._get_plan_time_for_event(events[i], events[i-1] if i > 0 else None)
+                )
+                
+                # Get plan_time for next node
+                next_plan_time = self._parse_datetime(
+                    self._get_plan_time_for_event(events[i+1], events[i])
+                )
+                
+                # Calculate planned duration between events
+                if current_plan_time is not None and next_plan_time is not None:
+                    diff = (next_plan_time - current_plan_time).total_seconds() / 3600
+                    planned_durations.append([diff])
+                else:
+                    planned_durations.append([0.0])
+        
+        if planned_durations:
+            self.planned_duration_scaler.fit(np.array(planned_durations))
+            print(f"\nFitted planned_duration scaler on {len(planned_durations)} samples")
+            print(f"  Mean: {np.mean(planned_durations):.2f} hours")
+            print(f"  Std: {np.std(planned_durations):.2f} hours")
+            print(f"  Min: {np.min(planned_durations):.2f} hours")
+            print(f"  Max: {np.max(planned_durations):.2f} hours")
+        
+        # ====================================================================
+        # NEW: Fit planned_transit scaler (planned transit time between events)
+        # ====================================================================
+        planned_transit_times = []
+        for _, row in df.iterrows():
+            events = row['events']
+            for i in range(len(events) - 1):
+                # Get plan_time for current node
+                current_plan_time = self._parse_datetime(
+                    self._get_plan_time_for_event(events[i], events[i-1] if i > 0 else None)
+                )
+                
+                # Get plan_time for next node
+                next_plan_time = self._parse_datetime(
+                    self._get_plan_time_for_event(events[i+1], events[i])
+                )
+                
+                # Calculate planned transit time
+                if current_plan_time is not None and next_plan_time is not None:
+                    planned_transit = (next_plan_time - current_plan_time).total_seconds() / 3600
+                    planned_transit_times.append([planned_transit])
+                else:
+                    planned_transit_times.append([0.0])
+        
+        if planned_transit_times:
+            self.planned_transit_scaler.fit(np.array(planned_transit_times))
+            print(f"\nFitted planned_transit scaler on {len(planned_transit_times)} samples")
+            print(f"  Mean: {np.mean(planned_transit_times):.2f} hours")
+            print(f"  Std: {np.std(planned_transit_times):.2f} hours")
+            print(f"  Min: {np.min(planned_transit_times):.2f} hours")
+            print(f"  Max: {np.max(planned_transit_times):.2f} hours")
+            print(f"  Median: {np.median(planned_transit_times):.2f} hours")
+            print(f"  25th percentile: {np.percentile(planned_transit_times, 25):.2f} hours")
+            print(f"  75th percentile: {np.percentile(planned_transit_times, 75):.2f} hours")
+            print(f"  95th percentile: {np.percentile(planned_transit_times, 95):.2f} hours")
+        # ====================================================================
         
         # Fit package feature scaler
         package_features = df[['weight', 'length', 'width', 'height']].fillna(0).values
@@ -725,7 +579,6 @@ class PackageLifecyclePreprocessor:
         
         node_features = []
         event_times = []
-        event_delays = []
         
         # Process node features
         for i, event in enumerate(events):
@@ -735,49 +588,68 @@ class PackageLifecyclePreprocessor:
             event_type_onehot = np.zeros(len(self.event_types))
             event_type_onehot[event_type_idx] = 1
             
-            # Sort center (current)
+            # Current sort center
             sort_center = event.get('sort_center', 'UNKNOWN')
             sort_center = str(sort_center) if sort_center else 'UNKNOWN'
             if sort_center not in self.sort_center_encoder.classes_:
                 sort_center = 'UNKNOWN'
             sort_center_idx = self.sort_center_encoder.transform([sort_center])[0]
             
-            # From sort center
-            if event_type in ['INDUCT', 'EXIT']:
-                # For INDUCT and EXIT, from_sort_center is own sort_center
-                from_sort_center_idx = sort_center_idx
-            else:  # LINEHAUL, DELIVERY
-                # For LINEHAUL and DELIVERY, from_sort_center is previous event's sort_center
-                if i > 0:
-                    prev_sort_center = events[i-1].get('sort_center', 'UNKNOWN')
-                    prev_sort_center = str(prev_sort_center) if prev_sort_center else 'UNKNOWN'
-                    if prev_sort_center not in self.sort_center_encoder.classes_:
-                        prev_sort_center = 'UNKNOWN'
-                    from_sort_center_idx = self.sort_center_encoder.transform([prev_sort_center])[0]
-                else:
-                    # First event but not INDUCT/EXIT (edge case)
-                    from_sort_center_idx = sort_center_idx
-            
-            # Carrier
-            carrier = event.get('carrier_id', 'UNKNOWN')
-            carrier = str(carrier) if carrier else 'UNKNOWN'
-            if carrier not in self.carrier_encoder.classes_:
-                carrier = 'UNKNOWN'
-            carrier_idx = self.carrier_encoder.transform([carrier])[0]
-            
-            # Leg type
-            leg_type = event.get('leg_type', 'UNKNOWN')
-            leg_type = str(leg_type) if leg_type else 'UNKNOWN'
-            if leg_type not in self.leg_type_encoder.classes_:
-                leg_type = 'UNKNOWN'
-            leg_type_idx = self.leg_type_encoder.transform([leg_type])[0]
-            
-            # Ship method
-            ship_method = event.get('ship_method', 'UNKNOWN')
-            ship_method = str(ship_method) if ship_method else 'UNKNOWN'
-            if ship_method not in self.ship_method_encoder.classes_:
-                ship_method = 'UNKNOWN'
-            ship_method_idx = self.ship_method_encoder.transform([ship_method])[0]
+            # Next node features (to_sort_center, carrier, leg_type, ship_method)
+            # For last node, use UNKNOWN
+            if i < num_events - 1:
+                next_event = events[i + 1]
+                
+                # to_sort_center: next node's sort center
+                to_sort_center = next_event.get('sort_center', 'UNKNOWN')
+                to_sort_center = str(to_sort_center) if to_sort_center else 'UNKNOWN'
+                if to_sort_center not in self.sort_center_encoder.classes_:
+                    to_sort_center = 'UNKNOWN'
+                to_sort_center_idx = self.sort_center_encoder.transform([to_sort_center])[0]
+                
+                # Carrier from next event
+                carrier = next_event.get('carrier_id', 'UNKNOWN')
+                carrier = str(carrier) if carrier else 'UNKNOWN'
+                if carrier not in self.carrier_encoder.classes_:
+                    carrier = 'UNKNOWN'
+                carrier_idx = self.carrier_encoder.transform([carrier])[0]
+                
+                # Leg type from next event
+                leg_type = next_event.get('leg_type', 'UNKNOWN')
+                leg_type = str(leg_type) if leg_type else 'UNKNOWN'
+                if leg_type not in self.leg_type_encoder.classes_:
+                    leg_type = 'UNKNOWN'
+                leg_type_idx = self.leg_type_encoder.transform([leg_type])[0]
+                
+                # Ship method from next event
+                ship_method = next_event.get('ship_method', 'UNKNOWN')
+                ship_method = str(ship_method) if ship_method else 'UNKNOWN'
+                if ship_method not in self.ship_method_encoder.classes_:
+                    ship_method = 'UNKNOWN'
+                ship_method_idx = self.ship_method_encoder.transform([ship_method])[0]
+                
+                # Is different sort center flag
+                is_different_sc = float(sort_center != to_sort_center)
+                
+                # Hops remaining to end
+                hops_remaining = num_events - i - 1
+                hops_remaining_normalized = hops_remaining / max(1, num_events - 1)
+                
+                # Next event type (one-hot)
+                next_event_type = str(next_event['event_type'])
+                next_event_type_idx = self.event_type_encoder.transform([next_event_type])[0]
+                next_event_type_onehot = np.zeros(len(self.event_types))
+                next_event_type_onehot[next_event_type_idx] = 1
+                
+            else:
+                # Last node - use UNKNOWN for all next node features
+                to_sort_center_idx = self.sort_center_encoder.transform(['UNKNOWN'])[0]
+                carrier_idx = self.carrier_encoder.transform(['UNKNOWN'])[0]
+                leg_type_idx = self.leg_type_encoder.transform(['UNKNOWN'])[0]
+                ship_method_idx = self.ship_method_encoder.transform(['UNKNOWN'])[0]
+                is_different_sc = 0.0
+                hops_remaining_normalized = 0.0
+                next_event_type_onehot = np.zeros(len(self.event_types))
             
             # Event time
             event_time = self._parse_datetime(event['event_time'])
@@ -794,7 +666,6 @@ class PackageLifecyclePreprocessor:
             
             # Calculate time vs plan (delay)
             time_vs_plan = self._calculate_time_vs_plan(event['event_time'], plan_time)
-            event_delays.append(time_vs_plan)
             
             # Normalize time_vs_plan
             time_vs_plan_scaled = self.plan_time_diff_scaler.transform([[time_vs_plan]])[0, 0]
@@ -807,10 +678,6 @@ class PackageLifecyclePreprocessor:
             
             # Extract temporal features from next_plan_time (for prediction)
             next_plan_temporal_features = self._extract_next_plan_temporal_features(next_plan_time)
-            
-            # Calculate next_plan_time - event_time (for node feature)
-            next_plan_time_diff = self._calculate_time_vs_plan(next_plan_time, event['event_time'])
-            next_plan_time_diff_scaled = self.edge_time_diff_scaler.transform([[next_plan_time_diff]])[0, 0]
             
             if i == 0:
                 time_since_start = 0
@@ -835,17 +702,71 @@ class PackageLifecyclePreprocessor:
             if event_type in ['INDUCT', 'LINEHAUL']:
                 problem_encoding = self._encode_problems(event.get('problem'))
             
-            # Combine features (includes next_plan_temporal_features and next_plan_time_diff for prediction)
+            # Is first/last event flags
+            is_first_event = 1.0 if i == 0 else 0.0
+            is_last_event = 1.0 if i == num_events - 1 else 0.0
+            
+            # ============================================================
+            # Add "edge features" as NODE features (for non-last nodes)
+            # ============================================================
+            if i < num_events - 1:
+                # Get current event time
+                current_event_time = self._parse_datetime(events[i].get('event_time'))
+                
+                # Get plan_time for next node (node i+1)
+                next_plan_time_dt = self._parse_datetime(
+                    self._get_plan_time_for_event(events[i+1], events[i])
+                )
+                
+                # Get plan_time for current node
+                current_plan_time = self._parse_datetime(
+                    self._get_plan_time_for_event(events[i], events[i-1] if i > 0 else None)
+                )
+                
+                # Calculate: next_plan_time - current_event_time
+                if current_event_time is not None and next_plan_time_dt is not None:
+                    planned_remaining = (next_plan_time_dt - current_event_time).total_seconds() / 3600
+                else:
+                    planned_remaining = 0.0
+                
+                # Calculate: next_plan_time - current_plan_time
+                if current_plan_time is not None and next_plan_time_dt is not None:
+                    planned_duration = (next_plan_time_dt - current_plan_time).total_seconds() / 3600
+                else:
+                    planned_duration = 0.0
+                
+                # NEW: Calculate planned transit time (same as planned_duration)
+                # This is conceptually an edge feature but stored on node
+                planned_transit_time = planned_duration
+                
+                # Scale these features
+                planned_remaining_scaled = self.planned_remaining_scaler.transform([[planned_remaining]])[0, 0]
+                planned_duration_scaled = self.planned_duration_scaler.transform([[planned_duration]])[0, 0]
+                planned_transit_scaled = self.planned_transit_scaler.transform([[planned_transit_time]])[0, 0]
+                
+                # Has next plan time flag
+                has_next_plan = 1.0 if next_plan_time_dt is not None else 0.0
+            else:
+                # Last node - no next event
+                planned_remaining_scaled = 0.0
+                planned_duration_scaled = 0.0
+                planned_transit_scaled = 0.0
+                has_next_plan = 0.0
+            # ============================================================
+            
+            # Combine features
             features = np.concatenate([
-                event_type_onehot,
-                [sort_center_idx, from_sort_center_idx, carrier_idx, leg_type_idx, ship_method_idx],
-                [time_since_start, time_since_prev, position, dwelling_time],
-                temporal_features,  # 6 features
-                [time_vs_plan_scaled, has_plan_time],
+                event_type_onehot,  # Current event type one-hot
+                [sort_center_idx, to_sort_center_idx, carrier_idx, leg_type_idx, ship_method_idx],  # Categorical indices
+                [time_since_start, time_since_prev, position, dwelling_time],  # Time features
+                temporal_features,  # 6 temporal features (current time)
+                [time_vs_plan_scaled, has_plan_time],  # Plan time features
                 next_plan_temporal_features,  # 7 features (6 temporal + 1 flag) - for prediction
-                [next_plan_time_diff_scaled],  # 1 feature (next_plan_time - event_time, scaled)
-                [missort_flag],
-                problem_encoding
+                [missort_flag],  # Missort flag
+                problem_encoding,  # Problem multi-hot encoding
+                [is_different_sc, hops_remaining_normalized, is_first_event, is_last_event],  # Additional features
+                next_event_type_onehot,  # Next event type one-hot
+                [planned_remaining_scaled, planned_duration_scaled, planned_transit_scaled, has_next_plan],  # Edge features as node features (NEW: added planned_transit_scaled)
             ])
             
             node_features.append(features)
@@ -869,38 +790,40 @@ class PackageLifecyclePreprocessor:
         package_features_expanded = np.tile(package_features_with_route, (num_events, 1))
         node_features = np.concatenate([node_features, package_features_expanded], axis=1)
         
-        # Edge features - empty (no edge features)
+        # Edge index (NO FEATURES)
         edge_index = []
-        edge_features = []
         
         if num_events > 1:
             for i in range(num_events - 1):
                 edge_index.append([i, i+1])
-                # No edge features
-                edge_features.append([])
             
             edge_index = np.array(edge_index, dtype=np.int64).T
-            edge_features = np.zeros((num_events - 1, 0), dtype=np.float32)  # Empty edge features
+            # ✅ EASY FIX: Edge features are just constant 0
+            num_edges = edge_index.shape[1]
+            edge_features = np.zeros((num_edges, 1), dtype=np.float32)  # Single constant feature
         else:
             edge_index = np.zeros((2, 0), dtype=np.int64)
-            edge_features = np.zeros((0, 0), dtype=np.float32)
+            edge_features = np.zeros((0, 1), dtype=np.float32)  # Single constant feature
         
         result = {
             'node_features': node_features,
             'edge_index': edge_index,
-            'edge_features': edge_features,
+            'edge_features': edge_features,  # No edge features
             'num_nodes': num_events,
             'package_id': package_data['package_id'],
             'route': route,
             'route_encoded': route_encoded
         }
         
-        # Labels: time to next event for each node (except last)
+        # ====================================================================
+        # Labels: TRANSIT TIME to next event (actual time gap)
+        # ====================================================================
         if return_labels:
             labels = []
             for i in range(num_events - 1):
-                time_to_next = (event_times[i+1] - event_times[i]).total_seconds() / 3600
-                labels.append(time_to_next)
+                # Transit time = next_event_time - current_event_time
+                transit_hours = (event_times[i+1] - event_times[i]).total_seconds() / 3600
+                labels.append(transit_hours)
             
             if labels:
                 labels = np.array(labels, dtype=np.float32).reshape(-1, 1)
@@ -916,6 +839,7 @@ class PackageLifecyclePreprocessor:
             label_mask = np.zeros(num_events, dtype=bool)
             label_mask[:-1] = True
             result['label_mask'] = label_mask
+        # ====================================================================
         
         return result
 
@@ -935,31 +859,32 @@ class PackageLifecyclePreprocessor:
             'time_features_dim': 4,
             'temporal_features_dim': 6,
             'plan_time_features_dim': 2,
-            'next_plan_temporal_features_dim': 7,  # Temporal encoding + flag (for prediction)
-            'next_plan_time_diff_dim': 1,  # next_plan_time - event_time (scaled)
+            'next_plan_temporal_features_dim': 7,
             'missort_dim': 1,
+            'additional_features_dim': 4,  # is_different_sc, hops_remaining, is_first, is_last
+            'edge_as_node_features_dim': 4,  # planned_remaining, planned_duration, planned_transit, has_next_plan (NEW: +1)
             'package_features_dim': 4,
             'route_features_dim': self.max_route_length,
-            'edge_features_dim': 0,  # No edge features
+            'edge_features_dim': 1,  # No edge features anymore
             'total_node_features': (
-                len(self.event_types) +
-                5 +  # sort_center_idx, from_sort_center_idx, carrier_idx, leg_type_idx, ship_method_idx
+                len(self.event_types) +  # Current event type
+                5 +  # sort_center_idx, to_sort_center_idx, carrier_idx, leg_type_idx, ship_method_idx
                 4 +  # time_since_start, time_since_prev, position, dwelling_time
                 6 +  # temporal features
                 2 +  # time_vs_plan_scaled, has_plan_time
                 7 +  # next_plan_time temporal features + flag (for prediction)
-                1 +  # next_plan_time - event_time (scaled)
                 1 +  # missort_flag
                 len(self.problem_types) +  # problem_encoding
+                4 +  # is_different_sc, hops_remaining, is_first, is_last
+                len(self.event_types) +  # Next event type
+                4 +  # Edge features as node features (planned_remaining, planned_duration, planned_transit, has_next_plan) (NEW: +1)
                 4 +  # package physical features
                 self.max_route_length  # route encoding
             )
         }
         
     def inverse_transform_time(self, scaled_time: np.ndarray) -> np.ndarray:
-        """Convert scaled time back to hours"""
+        """Convert scaled transit time back to hours"""
         if self.config.data.normalize_time:
             return self.time_scaler.inverse_transform(scaled_time)
         return scaled_time
-    
-    

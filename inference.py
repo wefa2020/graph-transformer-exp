@@ -42,8 +42,20 @@ class EventTimeInference:
         self.model.load_state_dict(self.checkpoint['model_state_dict'])
         self.model.eval()
         
-        print(f"✓ Loaded model from epoch {self.checkpoint['epoch']}")
-        print(f"✓ Validation loss: {self.checkpoint['val_loss']:.4f}")
+        print(f"✓ Loaded model from epoch {self.checkpoint.get('epoch', 'unknown')}")
+        
+        # Print validation metrics if available
+        if 'val_loss' in self.checkpoint:
+            print(f"✓ Validation loss: {self.checkpoint['val_loss']:.4f}")
+        if 'val_mae' in self.checkpoint:
+            print(f"✓ Validation MAE: {self.checkpoint['val_mae']:.4f} hours")
+        if 'val_mape' in self.checkpoint:
+            print(f"✓ Validation MAPE: {self.checkpoint['val_mape']:.2f}%")
+        
+        # Print training metrics if available
+        if 'train_loss' in self.checkpoint:
+            print(f"  Train loss: {self.checkpoint['train_loss']:.4f}")
+        
         print(f"✓ Using device: {self.device}")
         
         # Initialize Neptune extractor if endpoint provided
@@ -256,16 +268,19 @@ class EventTimeInference:
         
         return package_data
     
-    def predict_single_step(self, partial_lifecycle: Dict) -> float:
+    def predict_single_step(self, partial_lifecycle: Dict) -> Dict:
         """
-        Predict time delta for next event given partial lifecycle
+        Predict transit time to next event given partial lifecycle
         
         Args:
             partial_lifecycle: Dictionary with package info and events list
             
         Returns:
-            Predicted time delta in hours
-            
+            Dictionary with:
+                - predicted_transit_hours: Predicted time from last event to next event
+                - last_event_time: Time of last known event
+                - predicted_next_event_time: Predicted time of next event (last_time + transit)
+        
         Raises:
             ValueError: If partial_lifecycle is invalid
         """
@@ -299,7 +314,12 @@ class EventTimeInference:
         
         x = torch.tensor(processed['node_features'], dtype=torch.float)
         edge_index = torch.tensor(processed['edge_index'], dtype=torch.long)
-        edge_attr = torch.tensor(processed['edge_features'], dtype=torch.float)
+        
+        # Handle edge features (should be constant 0 now)
+        if processed['edge_features'] is not None:
+            edge_attr = torch.tensor(processed['edge_features'], dtype=torch.float)
+        else:
+            edge_attr = None
         
         data = Data(
             x=x,
@@ -321,12 +341,31 @@ class EventTimeInference:
             # Get prediction for last node (the one we're predicting from)
             last_pred = predictions[-1].cpu().numpy()
             
-            # Inverse transform
-            time_delta_hours = self.preprocessor.inverse_transform_time(
+            # Inverse transform to get transit time in hours
+            transit_hours = self.preprocessor.inverse_transform_time(
                 last_pred.reshape(1, -1)
             )[0, 0]
         
-        return float(time_delta_hours)
+        # ✅ FIX: Convert numpy.float32 to Python float
+        transit_hours = float(transit_hours)
+        
+        # Get the last event time
+        last_event = partial_lifecycle['events'][-1]
+        last_event_time = self._parse_datetime(last_event['event_time'])
+        
+        if last_event_time is None:
+            raise ValueError("Invalid last event time")
+        
+        # Predicted next event time = last event time + predicted transit time
+        predicted_next_event_time = last_event_time + timedelta(hours=transit_hours)
+        
+        result = {
+            'predicted_transit_hours': transit_hours,  # Already converted to float
+            'last_event_time': last_event_time,
+            'predicted_next_event_time': predicted_next_event_time
+        }
+        
+        return result
     
     def convert_to_serializable(self, obj):
         """
@@ -414,11 +453,13 @@ class EventTimeInference:
                 }
                 continue
             
-            # Predict time to current event
+            # Predict transit time for current event
             try:
-                predicted_delta_hours = self.predict_single_step(partial_lifecycle)
+                pred_result = self.predict_single_step(partial_lifecycle)
+                predicted_transit_hours = float(pred_result['predicted_transit_hours'])
+                predicted_event_time = pred_result['predicted_next_event_time']
                 
-                # Calculate times
+                # Get times
                 previous_event_time = events[i-1]['event_time']
                 actual_event_time = current_event['event_time']
                 
@@ -431,23 +472,33 @@ class EventTimeInference:
                 if previous_event_time is None or actual_event_time is None:
                     raise ValueError("Invalid event times")
                 
-                predicted_event_time = previous_event_time + timedelta(hours=predicted_delta_hours)
+                # Actual transit time
+                actual_transit_hours = (actual_event_time - previous_event_time).total_seconds() / 3600
                 
-                # Calculate actual time delta
-                actual_delta = actual_event_time - previous_event_time
-                actual_delta_hours = actual_delta.total_seconds() / 3600
+                # Transit time prediction error
+                transit_error_hours = predicted_transit_hours - actual_transit_hours
+                absolute_transit_error_hours = abs(transit_error_hours)
                 
-                # Calculate error
-                error_hours = predicted_delta_hours - actual_delta_hours
+                # Get planned time for the current event
+                current_plan_time = self._parse_datetime(
+                    self.preprocessor._get_plan_time_for_event(current_event, events[i-1])
+                )
                 
-                # Add prediction fields to the event
-                events[i]['prediction'] = {
+                # ✅ Build prediction output with plan_time
+                prediction_dict = {
                     'predicted_event_time': predicted_event_time.isoformat(),
-                    'predicted_delta_hours': round(predicted_delta_hours, 2),
-                    'actual_delta_hours': round(actual_delta_hours, 2),
-                    'error_hours': round(error_hours, 2)
+                    'predicted_transit_hours': round(predicted_transit_hours, 2),
+                    'actual_transit_hours': round(actual_transit_hours, 2),
+                    'transit_error_hours': round(transit_error_hours, 2),
+                    'absolute_transit_error_hours': round(absolute_transit_error_hours, 2)
                 }
                 
+                # Add plan_time if available
+                if current_plan_time is not None:
+                    prediction_dict['plan_time'] = current_plan_time.isoformat()
+                
+                events[i]['prediction'] = prediction_dict
+                    
             except Exception as e:
                 print(f"    ✗ Failed to predict event {i}: {e}")
                 import traceback
@@ -511,7 +562,15 @@ class EventTimeInference:
                     # Count successful predictions
                     predicted_events = [e for e in result['events'] if 'prediction' in e]
                     successful = [e for e in predicted_events if 'error' not in e['prediction']]
-                    print(f"  ✓ Predicted {len(successful)}/{len(predicted_events)} events")
+                    
+                    # Calculate average errors
+                    if successful:
+                        avg_transit_error = np.mean([e['prediction']['absolute_transit_error_hours'] for e in successful])
+                        
+                        print(f"  ✓ Predicted {len(successful)}/{len(predicted_events)} events")
+                        print(f"    Avg transit error: {avg_transit_error:.2f} hours")
+                    else:
+                        print(f"  ✓ Predicted {len(successful)}/{len(predicted_events)} events")
                     
             except Exception as e:
                 print(f"  ✗ Error: {e}")
@@ -553,7 +612,15 @@ class EventTimeInference:
                     # Count successful predictions
                     predicted_events = [e for e in result['events'] if 'prediction' in e]
                     successful = [e for e in predicted_events if 'error' not in e['prediction']]
-                    print(f"  ✓ Predicted {len(successful)}/{len(predicted_events)} events")
+                    
+                    # Calculate average errors
+                    if successful:
+                        avg_transit_error = np.mean([e['prediction']['absolute_transit_error_hours'] for e in successful])
+                        
+                        print(f"  ✓ Predicted {len(successful)}/{len(predicted_events)} events")
+                        print(f"    Avg transit error: {avg_transit_error:.2f} hours")
+                    else:
+                        print(f"  ✓ Predicted {len(successful)}/{len(predicted_events)} events")
                     
             except Exception as e:
                 print(f"  ✗ Error: {e}")
@@ -595,11 +662,17 @@ class EventTimeInference:
         if successful_packages:
             total_predictions = 0
             successful_predictions = 0
+            all_transit_errors = []
             
             for r in successful_packages:
                 predicted_events = [e for e in r['events'] if 'prediction' in e]
                 total_predictions += len(predicted_events)
-                successful_predictions += len([e for e in predicted_events if 'error' not in e['prediction']])
+                successful = [e for e in predicted_events if 'error' not in e['prediction']]
+                successful_predictions += len(successful)
+                
+                # Collect errors
+                for e in successful:
+                    all_transit_errors.append(e['prediction']['absolute_transit_error_hours'])
             
             print(f"\nPrediction Statistics:")
             print(f"  Total event predictions: {total_predictions}")
@@ -607,6 +680,17 @@ class EventTimeInference:
             print(f"  Failed predictions: {total_predictions - successful_predictions}")
             if total_predictions > 0:
                 print(f"  Success rate: {successful_predictions/total_predictions*100:.1f}%")
+            
+            if all_transit_errors:
+                print(f"\nTransit Time Error Metrics:")
+                print(f"  MAE (hours): {np.mean(all_transit_errors):.2f}")
+                print(f"  Median AE (hours): {np.median(all_transit_errors):.2f}")
+                print(f"  P25 (hours): {np.percentile(all_transit_errors, 25):.2f}")
+                print(f"  P75 (hours): {np.percentile(all_transit_errors, 75):.2f}")
+                print(f"  P90 (hours): {np.percentile(all_transit_errors, 90):.2f}")
+                print(f"  P95 (hours): {np.percentile(all_transit_errors, 95):.2f}")
+                print(f"  Min error (hours): {np.min(all_transit_errors):.2f}")
+                print(f"  Max error (hours): {np.max(all_transit_errors):.2f}")
         
         print(f"{'='*80}\n")
     
@@ -627,34 +711,17 @@ def main():
     # ============================================================================
     # CONFIGURE PACKAGE IDs HERE
     # ============================================================================
-    #  "TBA325664407961",
-    #     "TBA325671393305",
-    #     "TBA325694416401",
-    #     "TBA325716777454",
-    #     "TBA325683690446",
-    #     "TBA325684653809",
-    #     "TBA325452020989",
-    #     "9361289768756275475209",
-    #     "TBA325678810142",
-    #     "TBA325666970614",
-    #     "9361289768755959876011",
-    #     "TBA325690809267",
-    #     "9361289768756279450332"
     package_ids = [       
        "TBA325136379051",
         "TBA325136522364",
         "TBA325136422852",
         "TBA325136522895",
         "TBA325136430244"
-                        # Add more package IDs here
-            ]
+    ]
     # ============================================================================
     
     print("\n" + "="*80)
-    # ============================================================================
-    
-    print("\n" + "="*80)
-    print("EVENT TIME PREDICTION - BATCH INFERENCE")
+    print("EVENT TIME PREDICTION - BATCH INFERENCE (TRANSIT TIME)")
     print("="*80)
     print(f"Will process {len(package_ids)} packages")
     print("="*80 + "\n")

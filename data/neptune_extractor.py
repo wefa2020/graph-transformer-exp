@@ -693,7 +693,7 @@ class NeptuneDataExtractor:
         with open(f"{output_dir}/{json_path}", 'r') as f:
             data = json.load(f)
 
-        validator = PackageEventValidator(max_time_vs_plan_hours=8.0, min_linehaul_exit_minutes=5.0)
+        validator = PackageEventValidator(max_time_vs_plan_hours=800.0, min_linehaul_exit_minutes=5.0)
         result = validator.filter_packages(data, verbose=True)
 
         return pd.DataFrame(result['valid_packages'])
