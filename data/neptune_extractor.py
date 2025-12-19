@@ -4,13 +4,404 @@ from typing import List, Dict, Tuple, Set, Optional
 from gremlin_python.driver import client, serializer
 import json
 import os
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from collections import defaultdict
-import threading
+import multiprocessing
+from multiprocessing import Manager
 from tqdm import tqdm
 import time
+<<<<<<< HEAD
 from utils.package_filter import PackageEventValidator
   
+=======
+
+# Global variable for process-local Neptune client
+_process_client = None
+_process_endpoint = None
+
+
+def init_worker(endpoint: str):
+    """Initialize Neptune client for each worker process"""
+    global _process_client, _process_endpoint
+    _process_endpoint = endpoint
+    _process_client = client.Client(
+        f'wss://{endpoint}/gremlin',
+        'g',
+        message_serializer=serializer.GraphSONSerializersV2d0()
+    )
+
+
+def get_process_client():
+    """Get or create client for current process"""
+    global _process_client, _process_endpoint
+    if _process_client is None and _process_endpoint is not None:
+        _process_client = client.Client(
+            f'wss://{_process_endpoint}/gremlin',
+            'g',
+            message_serializer=serializer.GraphSONSerializersV2d0()
+        )
+    return _process_client
+
+
+def process_single_package(args: Tuple[str, str]) -> Tuple[Optional[Dict], Optional[str], Optional[str]]:
+    """
+    Process a single package - designed to run in separate process
+    
+    Args:
+        args: Tuple of (package_id, endpoint)
+    
+    Returns:
+        Tuple of (package_data, invalid_reason, package_id)
+        - package_data: Dict if valid, None if invalid
+        - invalid_reason: 'missing_time', 'invalid_sequence', 'missing_events', or None
+        - package_id: The package ID (for tracking invalid packages)
+    """
+    package_id, endpoint = args
+    
+    # Get or create client for this process
+    gremlin_client = get_process_client()
+    if gremlin_client is None:
+        # Fallback: create new client if initializer wasn't called
+        gremlin_client = client.Client(
+            f'wss://{endpoint}/gremlin',
+            'g',
+            message_serializer=serializer.GraphSONSerializersV2d0()
+        )
+    
+    try:
+        # Extract package edges
+        package_data = _extract_package_edges(gremlin_client, package_id)
+        
+        if package_data is None:
+            return None, 'missing_time', package_id
+        
+        # Validate sequence
+        is_valid, invalid_reason = _validate_package_sequence(package_data)
+        if not is_valid:
+            return None, invalid_reason, package_id
+        
+        # Deduplicate events
+        package_data = _deduplicate_events(package_data)
+        
+        return package_data, None, package_id
+        
+    except Exception as e:
+        print(f"Error processing package {package_id}: {e}")
+        return None, 'error', package_id
+
+
+def _extract_package_edges(gremlin_client, package_id: str) -> Optional[Dict]:
+    """Extract all edges for a package including Problem and Missort"""
+    try:
+        # Escape package_id for query
+        escaped_id = package_id.replace("'", "\\'")
+        
+        # Get package properties
+        package_query = f"""
+        g.V()
+         .has('Package', 'id', '{escaped_id}')
+         .elementMap()
+        """
+        
+        result_set = gremlin_client.submit(package_query)
+        results = result_set.all().result()
+        
+        if not results:
+            return None
+        
+        package_props = results[0]
+        
+        package_data = {
+            'package_id': package_id,
+            'source_postal': package_props.get('source_postal_code'),
+            'dest_postal': package_props.get('destination_postal_code'),
+            'pdd': package_props.get('pdd'),
+            'weight': package_props.get('weight', 0),
+            'length': package_props.get('length', 0),
+            'width': package_props.get('width', 0),
+            'height': package_props.get('height', 0),
+            'events': []
+        }
+        
+        # Get Induct edges
+        induct_query = f"""
+        g.V()
+         .has('Package', 'id', '{escaped_id}')
+         .outE('Induct')
+         .project('edge', 'sort_center')
+         .by(elementMap())
+         .by(inV().values('id'))
+        """
+        
+        result_set = gremlin_client.submit(induct_query)
+        induct_edges = result_set.all().result()
+        
+        # Get Exit202 edges
+        exit_query = f"""
+        g.V()
+         .has('Package', 'id', '{escaped_id}')
+         .outE('Exit202')
+         .project('edge', 'sort_center')
+         .by(elementMap())
+         .by(inV().values('id'))
+        """
+        
+        result_set = gremlin_client.submit(exit_query)
+        exit_edges = result_set.all().result()
+        
+        # Get LineHaul edges
+        linehaul_query = f"""
+        g.V()
+         .has('Package', 'id', '{escaped_id}')
+         .outE('LineHaul')
+         .project('edge', 'sort_center')
+         .by(elementMap())
+         .by(inV().values('id'))
+        """
+        
+        result_set = gremlin_client.submit(linehaul_query)
+        linehaul_edges = result_set.all().result()
+        
+        # Get Problem edges
+        problem_query = f"""
+        g.V()
+         .has('Package', 'id', '{escaped_id}')
+         .outE('Problem')
+         .project('edge', 'sort_center')
+         .by(elementMap())
+         .by(inV().values('id'))
+        """
+        
+        result_set = gremlin_client.submit(problem_query)
+        problem_edges = result_set.all().result()
+        
+        # Get Missort edges
+        missort_query = f"""
+        g.V()
+         .has('Package', 'id', '{escaped_id}')
+         .outE('Missort')
+         .project('edge', 'sort_center')
+         .by(elementMap())
+         .by(inV().values('id'))
+        """
+        
+        result_set = gremlin_client.submit(missort_query)
+        missort_edges = result_set.all().result()
+        
+        # Get Delivery edge
+        delivery_query = f"""
+        g.V()
+         .has('Package', 'id', '{escaped_id}')
+         .outE('Delivery')
+         .project('edge', 'delivery_node')
+         .by(elementMap())
+         .by(inV().elementMap())
+        """
+        
+        result_set = gremlin_client.submit(delivery_query)
+        delivery_edges = result_set.all().result()
+        
+        # Build lookup dictionaries for Problem and Missort
+        problems_by_sc = defaultdict(list)
+        missorts_by_sc = defaultdict(set)
+        
+        for edge_data in problem_edges:
+            edge = edge_data['edge']
+            event_time = edge.get('event_time')
+            if event_time:
+                problems_by_sc[edge_data['sort_center']].append({
+                    'event_time': event_time,
+                    'container_problems': edge.get('container_problems', '')
+                })
+        
+        # Sort problems by time for each sort center
+        for sc in problems_by_sc:
+            problems_by_sc[sc].sort(key=lambda x: x['event_time'])
+        
+        for edge_data in missort_edges:
+            edge = edge_data['edge']
+            event_time = edge.get('event_time')
+            if event_time:
+                missorts_by_sc[edge_data['sort_center']].add(event_time)
+        
+        # Process Induct edges
+        for edge_data in induct_edges:
+            edge = edge_data['edge']
+            event_time = edge.get('event_time')
+            
+            if not event_time:
+                return None
+            
+            sort_center = edge_data['sort_center']
+            has_missort = sort_center in missorts_by_sc and len(missorts_by_sc[sort_center]) > 0
+            
+            package_data['events'].append({
+                'event_type': 'INDUCT',
+                'sort_center': sort_center,
+                'event_time': event_time,
+                'plan_time': edge.get('plan_time'),
+                'cpt': edge.get('cpt'),
+                'leg_type': edge.get('leg_type'),
+                'carrier_id': edge.get('carrier_id'),
+                'load_id': edge.get('load_id'),
+                'ship_method': edge.get('ship_method'),
+                'missort': has_missort
+            })
+        
+        # Process Exit202 edges
+        for edge_data in exit_edges:
+            edge = edge_data['edge']
+            event_time = edge.get('event_time')
+            
+            if not event_time:
+                return None
+            
+            sort_center = edge_data['sort_center']
+            
+            # Find last problem before this exit event
+            problem_info = None
+            if sort_center in problems_by_sc:
+                relevant_problems = [
+                    p for p in problems_by_sc[sort_center]
+                    if p['event_time'] <= event_time
+                ]
+                if relevant_problems:
+                    problem_info = relevant_problems[-1]['container_problems']
+            
+            package_data['events'].append({
+                'event_type': 'EXIT',
+                'sort_center': sort_center,
+                'event_time': event_time,
+                'dwelling_seconds': edge.get('dwelling_seconds'),
+                'leg_type': edge.get('leg_type'),
+                'carrier_id': edge.get('carrier_id'),
+                'problem': problem_info
+            })
+        
+        # Process LineHaul edges
+        for edge_data in linehaul_edges:
+            edge = edge_data['edge']
+            event_time = edge.get('event_time')
+            
+            if not event_time:
+                return None
+            
+            sort_center = edge_data['sort_center']
+            has_missort = sort_center in missorts_by_sc and len(missorts_by_sc[sort_center]) > 0
+            
+            package_data['events'].append({
+                'event_type': 'LINEHAUL',
+                'sort_center': sort_center,
+                'event_time': event_time,
+                'plan_time': edge.get('plan_time'),
+                'cpt': edge.get('cpt'),
+                'leg_type': edge.get('leg_type'),
+                'carrier_id': edge.get('carrier_id'),
+                'ship_method': edge.get('ship_method'),
+                'missort': has_missort
+            })
+        
+        # Process Delivery edge
+        for edge_data in delivery_edges:
+            edge = edge_data['edge']
+            event_time = edge.get('event_time')
+            
+            if not event_time:
+                return None
+            
+            delivery_node = edge_data.get('delivery_node', {})
+            
+            package_data['events'].append({
+                'event_type': 'DELIVERY',
+                'event_time': event_time,
+                'plan_time': edge.get('plan_time'),
+                'delivery_station': edge.get('delivery_station'),
+                'ship_method': edge.get('ship_method'),
+                'delivery_location': {
+                    'id': delivery_node.get('id'),
+                    'city': delivery_node.get('city'),
+                    'county': delivery_node.get('county'),
+                    'state': delivery_node.get('state_id'),
+                    'lat': delivery_node.get('lat'),
+                    'lng': delivery_node.get('lng')
+                }
+            })
+        
+        return package_data
+        
+    except Exception as e:
+        print(f"Error extracting edges for package {package_id}: {e}")
+        return None
+
+
+def _validate_package_sequence(package_data: Dict) -> Tuple[bool, Optional[str]]:
+    """Validate that package has proper event sequence"""
+    events = package_data['events']
+    
+    if not events:
+        return False, 'missing_events'
+    
+    event_types = set(e['event_type'] for e in events)
+    
+    # Must have INDUCT, EXIT, and DELIVERY
+    required_events = {'INDUCT', 'EXIT', 'DELIVERY'}
+    if not required_events.issubset(event_types):
+        return False, 'missing_events'
+    
+    # Check that we have at least 3 events (minimum lifecycle)
+    if len(events) < 3:
+        return False, 'missing_events'
+    
+    # Validate sort center events have matching EXIT/LINEHAUL pairs
+    sort_center_events = defaultdict(list)
+    for event in events:
+        if event['event_type'] in ['INDUCT', 'EXIT', 'LINEHAUL']:
+            sc = event.get('sort_center')
+            if sc:
+                sort_center_events[sc].append(event['event_type'])
+    
+    # Each sort center should have balanced events
+    for sc, sc_events in sort_center_events.items():
+        has_entry = 'INDUCT' in sc_events or 'LINEHAUL' in sc_events
+        has_exit = 'EXIT' in sc_events
+        
+        if not (has_entry and has_exit):
+            return False, 'invalid_sequence'
+    
+    return True, None
+
+
+def _deduplicate_events(package_data: Dict) -> Dict:
+    """Deduplicate events"""
+    events = package_data['events']
+    
+    # Sort events by time
+    events.sort(key=lambda x: x['event_time'])
+    
+    # Deduplicate
+    seen = set()
+    deduped_events = []
+    
+    for event in events:
+        if event['event_type'] == 'DELIVERY':
+            if 'DELIVERY' not in seen:
+                deduped_events.append(event)
+                seen.add('DELIVERY')
+        else:
+            sc = event.get('sort_center', '')
+            key = (sc, event['event_type'])
+            
+            if key not in seen:
+                deduped_events.append(event)
+                seen.add(key)
+    
+    package_data['events'] = deduped_events
+    package_data['num_events'] = len(deduped_events)
+    
+    return package_data
+
+
+>>>>>>> 43a4a96 (large set 1)
 class NeptuneDataExtractor:
     """Extract package lifecycle data from Neptune using Gremlin Client with batch processing"""
     
@@ -19,71 +410,43 @@ class NeptuneDataExtractor:
         self.use_iam = use_iam
         self.max_workers = max_workers
         
-        # Thread-safe connection pool
-        self.client_pool = []
-        self.pool_lock = threading.Lock()
-        
-        # Initialize clients
-        for _ in range(max_workers):
-            gremlin_client = client.Client(
-                f'wss://{endpoint}/gremlin',
-                'g',
-                message_serializer=serializer.GraphSONSerializersV2d0()
-            )
-            self.client_pool.append(gremlin_client)
-        
-        # Tracking invalid packages
-        self.invalid_packages = {
-            'missing_time': set(),
-            'invalid_sequence': set(),
-            'missing_events': set()
-        }
-        
-        self.lock = threading.Lock()
-    
-    def get_client(self):
-        """Get a client from the pool"""
-        with self.pool_lock:
-            if self.client_pool:
-                return self.client_pool.pop()
-        # If pool is empty, create new client
-        return client.Client(
-            f'wss://{self.endpoint}/gremlin',
+        # Single client for non-parallel operations
+        self.main_client = client.Client(
+            f'wss://{endpoint}/gremlin',
             'g',
             message_serializer=serializer.GraphSONSerializersV2d0()
         )
-    
-    def return_client(self, gremlin_client):
-        """Return client to pool"""
-        with self.pool_lock:
-            if len(self.client_pool) < self.max_workers:
-                self.client_pool.append(gremlin_client)
-            else:
-                gremlin_client.close()
+        
+        # Tracking invalid packages (using Manager for process-safe sharing)
+        self.manager = Manager()
+        self.invalid_packages = {
+            'missing_time': self.manager.list(),
+            'invalid_sequence': self.manager.list(),
+            'missing_events': self.manager.list(),
+            'error': self.manager.list()
+        }
     
     def count_delivered_packages(
         self,
         start_date: str,
         end_date: str
     ) -> int:
-        """
-        Count total number of delivered packages in date range
-        """
+        """Count total number of delivered packages in date range"""
         print("Counting total packages...")
-        
-        gremlin_client = self.get_client()
         
         try:
             query = f"""
             g.V()
              .hasLabel('Package')
              .has('is_delivered', 'True')
+             .has('has_cycle', false)
+             .has('is_return', false)
              .has('delivered_date', gte(datetime('{start_date}')))
              .has('delivered_date', lte(datetime('{end_date}')))
              .count()
             """
             
-            result_set = gremlin_client.submit(query)
+            result_set = self.main_client.submit(query)
             count = result_set.all().result()[0]
             
             print(f"Total packages to process: {count}")
@@ -92,8 +455,6 @@ class NeptuneDataExtractor:
         except Exception as e:
             print(f"Error counting packages: {e}")
             return 0
-        finally:
-            self.return_client(gremlin_client)
     
     def extract_delivered_packages_batch(
         self,
@@ -102,24 +463,21 @@ class NeptuneDataExtractor:
         skip: int = 0,
         limit: int = 1000
     ) -> List[str]:
-        """
-        Extract a batch of delivered package IDs in date range
-        Uses skip/limit for pagination
-        """
-        gremlin_client = self.get_client()
-        
+        """Extract a batch of delivered package IDs in date range"""
         try:
             query = f"""
             g.V()
              .hasLabel('Package')
              .has('is_delivered', 'True')
+             .has('has_cycle', false)
+             .has('is_return', false)
              .has('delivered_date', gte(datetime('{start_date}')))
              .has('delivered_date', lte(datetime('{end_date}')))
              .range({skip}, {skip + limit})
              .values('id')
             """
             
-            result_set = gremlin_client.submit(query)
+            result_set = self.main_client.submit(query)
             package_ids = result_set.all().result()
             
             return package_ids
@@ -127,6 +485,7 @@ class NeptuneDataExtractor:
         except Exception as e:
             print(f"Error extracting package batch (skip={skip}): {e}")
             return []
+<<<<<<< HEAD
         finally:
             self.return_client(gremlin_client)
     
@@ -484,27 +843,46 @@ class NeptuneDataExtractor:
         package_data = self.deduplicate_events(package_data)
         
         return package_data
+=======
+>>>>>>> 43a4a96 (large set 1)
     
     def process_package_batch(self, package_ids: List[str]) -> List[Dict]:
-        """Process a batch of packages with multi-threading"""
+        """Process a batch of packages with multi-processing"""
         
         valid_lifecycles = []
         
-        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+        # Prepare arguments for worker processes
+        args_list = [(pkg_id, self.endpoint) for pkg_id in package_ids]
+        
+        # Use ProcessPoolExecutor with initializer
+        with ProcessPoolExecutor(
+            max_workers=self.max_workers,
+            initializer=init_worker,
+            initargs=(self.endpoint,)
+        ) as executor:
+            # Submit all tasks
             future_to_package = {
-                executor.submit(self.process_package, pkg_id): pkg_id 
-                for pkg_id in package_ids
+                executor.submit(process_single_package, args): args[0]
+                for args in args_list
             }
             
+            # Process results with progress bar
             with tqdm(total=len(package_ids), desc="Processing batch") as pbar:
                 for future in as_completed(future_to_package):
                     try:
-                        result = future.result()
+                        result, invalid_reason, package_id = future.result()
+                        
                         if result is not None:
                             valid_lifecycles.append(result)
+                        elif invalid_reason:
+                            # Track invalid packages
+                            if invalid_reason in self.invalid_packages:
+                                self.invalid_packages[invalid_reason].append(package_id)
+                                
                     except Exception as e:
                         package_id = future_to_package[future]
                         print(f"\nError processing package {package_id}: {e}")
+                        self.invalid_packages['error'].append(package_id)
                     
                     pbar.update(1)
         
@@ -533,8 +911,8 @@ class NeptuneDataExtractor:
         start_date: str,
         end_date: str,
         output_dir: str = 'data/graph-data',
-        query_batch_size: int = 1000,
-        save_batch_size: int = 100
+        query_batch_size: int = 10000,
+        save_batch_size: int = 1000
     ) -> pd.DataFrame:
         """
         Main method to extract package lifecycles with batch processing
@@ -543,17 +921,17 @@ class NeptuneDataExtractor:
             start_date: Start date in ISO format
             end_date: End date in ISO format
             output_dir: Directory to save results
-            query_batch_size: Number of packages to query from Neptune at once (default 1000)
-            save_batch_size: Number of packages per output file (default 100)
+            query_batch_size: Number of packages to query from Neptune at once
+            save_batch_size: Number of packages per output file
         """
         
         print("="*80)
-        print("NEPTUNE DATA EXTRACTION (Gremlin Client - Batch Mode)")
+        print("NEPTUNE DATA EXTRACTION (Gremlin Client - Process Pool Mode)")
         print("="*80)
         print(f"Start Date: {start_date}")
         print(f"End Date: {end_date}")
         print(f"Query Batch Size: {query_batch_size}")
-        print(f"Max Workers: {self.max_workers}")
+        print(f"Max Workers (Processes): {self.max_workers}")
         print(f"Output Directory: {output_dir}")
         print("="*80)
         print()
@@ -561,7 +939,7 @@ class NeptuneDataExtractor:
         # Create output directory
         os.makedirs(output_dir, exist_ok=True)
         
-        # Count total packages (optional - comment out if this times out too)
+        # Count total packages
         try:
             total_count = self.count_delivered_packages(start_date, end_date)
         except:
@@ -641,11 +1019,13 @@ class NeptuneDataExtractor:
         print(f"  - Missing time fields: {len(self.invalid_packages['missing_time'])}")
         print(f"  - Invalid sequence: {len(self.invalid_packages['invalid_sequence'])}")
         print(f"  - Missing events: {len(self.invalid_packages['missing_events'])}")
+        print(f"  - Errors: {len(self.invalid_packages['error'])}")
         
-        total_invalid = len(
-            self.invalid_packages['missing_time'] | 
-            self.invalid_packages['invalid_sequence'] | 
-            self.invalid_packages['missing_events']
+        total_invalid = (
+            len(self.invalid_packages['missing_time']) +
+            len(self.invalid_packages['invalid_sequence']) +
+            len(self.invalid_packages['missing_events']) +
+            len(self.invalid_packages['error'])
         )
         print(f"  - Total invalid: {total_invalid}")
         
@@ -666,7 +1046,8 @@ class NeptuneDataExtractor:
             json.dump({
                 'missing_time': list(self.invalid_packages['missing_time']),
                 'invalid_sequence': list(self.invalid_packages['invalid_sequence']),
-                'missing_events': list(self.invalid_packages['missing_events'])
+                'missing_events': list(self.invalid_packages['missing_events']),
+                'error': list(self.invalid_packages['error'])
             }, f, indent=2)
         print(f"  ✓ Saved invalid package IDs")
         
@@ -700,13 +1081,16 @@ class NeptuneDataExtractor:
     
     def close(self):
         """Close all connections"""
-        with self.pool_lock:
-            for gremlin_client in self.client_pool:
-                try:
-                    gremlin_client.close()
-                except:
-                    pass
-            self.client_pool.clear()
+        try:
+            self.main_client.close()
+        except:
+            pass
+        
+        # Shutdown manager
+        try:
+            self.manager.shutdown()
+        except:
+            pass
 
 
 # Helper functions
@@ -725,14 +1109,20 @@ def epoch_ms_to_datetime(epoch_ms: int) -> str:
 # Example usage
 if __name__ == "__main__":
     # Configuration
+<<<<<<< HEAD
     NEPTUNE_ENDPOINT = "swa-shipgraph-neptune-instance-prod-us-east-1.c6fskces27nt.us-east-1.neptune.amazonaws.com:8182"
     START_DATE = "2025-11-01T08:00:00Z"
     END_DATE = "2025-11-01T14:10:59Z"
+=======
+    NEPTUNE_ENDPOINT = "swa-shipgraph-neptune-instance-prod-us-east-1-read-replica.c6fskces27nt.us-east-1.neptune.amazonaws.com:8182"
+    START_DATE = "2025-11-10T00:00:00Z"
+    END_DATE = "2025-12-10T00:00:00Z"
+>>>>>>> 43a4a96 (large set 1)
     
     # Initialize extractor
     extractor = NeptuneDataExtractor(
         endpoint=NEPTUNE_ENDPOINT,
-        max_workers=10
+        max_workers=30  # Number of processes
     )
     
     try:
@@ -741,8 +1131,8 @@ if __name__ == "__main__":
             start_date=START_DATE,
             end_date=END_DATE,
             output_dir='data/graph-data',
-            query_batch_size=1000,  # Query 1000 package IDs at a time from Neptune
-            save_batch_size=100      # Save every 100 processed packages
+            query_batch_size=10000,
+            save_batch_size=1000
         )
         
         print(f"\nExtracted {len(df)} package lifecycles")

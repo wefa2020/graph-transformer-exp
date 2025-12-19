@@ -1,476 +1,590 @@
 import numpy as np
-from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from typing import Dict, List, Optional, Tuple, Union
+from dataclasses import dataclass, field
+import json
+import os
 
-def compute_metrics(y_pred, y_true, preprocessor=None, package_data=None):
+
+def compute_metrics(predictions: np.ndarray, targets: np.ndarray, 
+                    prefix: str = '') -> Dict[str, float]:
     """
-    Compute comprehensive metrics for transit time predictions
+    Compute comprehensive regression metrics
     
     Args:
-        y_pred: Predicted transit times (scaled or unscaled), shape (n_samples, 1) or (n_samples,)
-        y_true: True transit times (scaled or unscaled), shape (n_samples, 1) or (n_samples,)
-        preprocessor: Preprocessor with inverse_transform_time method
-        package_data: Optional (not used for transit time prediction)
+        predictions: Predicted values [N, 1] or [N]
+        targets: Target values [N, 1] or [N]
+        prefix: Optional prefix for metric names
     
     Returns:
-        Dictionary of metrics (None values are used for unavailable metrics)
+        Dict with metrics: mae, rmse, mse, mape, smape, r2, explained_variance
     """
-    # Ensure arrays are 1D
-    if y_pred.ndim > 1:
-        y_pred = y_pred.flatten()
-    if y_true.ndim > 1:
-        y_true = y_true.flatten()
+    # Flatten arrays
+    preds = np.asarray(predictions).flatten()
+    targs = np.asarray(targets).flatten()
     
-    # Check for empty arrays
-    if len(y_pred) == 0 or len(y_true) == 0:
-        return {
-            'mae': 0.0,
-            'rmse': 0.0,
-            'r2': 0.0,
-            'mae_hours': 0.0,
-            'rmse_hours': 0.0,
-            'mape': None,
-            'median_ape': None,
-            'mape_samples': 0,
-            'median_error': 0.0,
-            'mean_signed_error_hours': 0.0,
-        }
+    # Ensure same length
+    assert len(preds) == len(targs), f"Length mismatch: {len(preds)} vs {len(targs)}"
     
-    metrics = {}
+    n_samples = len(preds)
     
-    # Basic metrics (scaled)
-    metrics['mae'] = float(mean_absolute_error(y_true, y_pred))
-    metrics['rmse'] = float(np.sqrt(mean_squared_error(y_true, y_pred)))
+    if n_samples == 0:
+        return {f'{prefix}mae': 0.0, f'{prefix}rmse': 0.0, f'{prefix}r2': 0.0}
     
-    # R² score (handle edge cases)
-    try:
-        r2 = r2_score(y_true, y_pred)
-        if np.isnan(r2) or np.isinf(r2):
-            metrics['r2'] = 0.0
-        else:
-            metrics['r2'] = float(r2)
-    except:
-        metrics['r2'] = 0.0
-    
-    # Directional metrics (detect cancellation/bias)
-    errors = y_pred - y_true
+    # Errors
+    errors = preds - targs
     abs_errors = np.abs(errors)
+    squared_errors = errors ** 2
     
-    metrics['mae_positive'] = float(np.mean(abs_errors[errors > 0])) if (errors > 0).any() else 0.0
-    metrics['mae_negative'] = float(np.mean(abs_errors[errors < 0])) if (errors < 0).any() else 0.0
-    metrics['mean_signed_error'] = float(np.mean(errors))
+    # MAE (Mean Absolute Error)
+    mae = np.mean(abs_errors)
     
-    # Count directional errors
-    metrics['n_positive_errors'] = int((errors > 0).sum())
-    metrics['n_negative_errors'] = int((errors < 0).sum())
+    # MSE (Mean Squared Error)
+    mse = np.mean(squared_errors)
     
-    # Inverse transform to hours (these are TRANSIT TIMES in hours)
-    if preprocessor is not None and hasattr(preprocessor, 'inverse_transform_time'):
-        try:
-            y_pred_hours = preprocessor.inverse_transform_time(y_pred.reshape(-1, 1)).flatten()
-            y_true_hours = preprocessor.inverse_transform_time(y_true.reshape(-1, 1)).flatten()
-            
-            errors_hours = y_pred_hours - y_true_hours
-            abs_errors_hours = np.abs(errors_hours)
-            
-            # Transit time metrics in hours
-            metrics['mae_hours'] = float(np.mean(abs_errors_hours))
-            metrics['rmse_hours'] = float(np.sqrt(np.mean(errors_hours**2)))
-            
-            # Directional in hours
-            metrics['mae_hours_positive'] = float(np.mean(abs_errors_hours[errors_hours > 0])) if (errors_hours > 0).any() else 0.0
-            metrics['mae_hours_negative'] = float(np.mean(abs_errors_hours[errors_hours < 0])) if (errors_hours < 0).any() else 0.0
-            metrics['mean_signed_error_hours'] = float(np.mean(errors_hours))
-            
-            # Distribution metrics
-            metrics['median_error'] = float(np.median(abs_errors_hours))
-            metrics['p25_error'] = float(np.percentile(abs_errors_hours, 25))
-            metrics['p75_error'] = float(np.percentile(abs_errors_hours, 75))
-            metrics['p90_error'] = float(np.percentile(abs_errors_hours, 90))
-            metrics['p95_error'] = float(np.percentile(abs_errors_hours, 95))
-            metrics['p99_error'] = float(np.percentile(abs_errors_hours, 99))
-            
-            # Standard deviation
-            metrics['std_error_hours'] = float(np.std(errors_hours))
-            
-            # ================================================================
-            # MAPE: Calculate on TRANSIT TIMES
-            # ================================================================
-            mape_result = _calculate_mape_from_transit_times(y_pred_hours, y_true_hours)
-            metrics.update(mape_result)
-            
-        except Exception as e:
-            print(f"Warning: Error in inverse transform: {e}")
-            # Set defaults if transformation fails
-            metrics['mae_hours'] = metrics['mae']
-            metrics['rmse_hours'] = metrics['rmse']
-            metrics['median_error'] = float(np.median(abs_errors))
-            metrics['mean_signed_error_hours'] = metrics['mean_signed_error']
-            metrics['mape'] = None
-            metrics['median_ape'] = None
-            metrics['mape_samples'] = 0
+    # RMSE (Root Mean Squared Error)
+    rmse = np.sqrt(mse)
+    
+    # MAPE (Mean Absolute Percentage Error) - avoid division by zero
+    mask = np.abs(targs) > 1e-8
+    if mask.sum() > 0:
+        mape = np.mean(np.abs((targs[mask] - preds[mask]) / targs[mask])) * 100
     else:
-        # No preprocessor - use scaled values as proxy
-        metrics['mae_hours'] = metrics['mae']
-        metrics['rmse_hours'] = metrics['rmse']
-        metrics['median_error'] = float(np.median(abs_errors))
-        metrics['mean_signed_error_hours'] = metrics['mean_signed_error']
-        
-        # Calculate MAPE on scaled values
-        mape_result = _calculate_mape_from_transit_times(y_pred, y_true)
-        metrics.update(mape_result)
+        mape = 0.0
     
-    return metrics
-
-
-def _calculate_mape_from_transit_times(y_pred_hours, y_true_hours, min_threshold=0.1):
-    """
-    Calculate MAPE on transit time predictions
-    MAPE = mean(|predicted_time - actual_time| / |actual_time|) * 100
+    # SMAPE (Symmetric Mean Absolute Percentage Error)
+    denominator = (np.abs(preds) + np.abs(targs)) / 2
+    mask_smape = denominator > 1e-8
+    if mask_smape.sum() > 0:
+        smape = np.mean(abs_errors[mask_smape] / denominator[mask_smape]) * 100
+    else:
+        smape = 0.0
     
-    Only includes samples where actual_time > min_threshold to avoid division by near-zero
+    # R² Score (Coefficient of Determination)
+    ss_res = np.sum(squared_errors)
+    ss_tot = np.sum((targs - np.mean(targs)) ** 2)
+    r2 = 1 - (ss_res / (ss_tot + 1e-8)) if ss_tot > 1e-8 else 0.0
     
-    Args:
-        y_pred_hours: Predicted transit times in hours
-        y_true_hours: Actual transit times in hours
-        min_threshold: Minimum transit time to include (default 0.1 hours = 6 minutes)
+    # Explained Variance Score
+    var_res = np.var(errors)
+    var_targ = np.var(targs)
+    explained_variance = 1 - (var_res / (var_targ + 1e-8)) if var_targ > 1e-8 else 0.0
     
-    Returns:
-        dict with mape, median_ape, and mape_samples keys
-    """
+    # Max Error
+    max_error = np.max(abs_errors)
+    
+    # Median Absolute Error
+    median_ae = np.median(abs_errors)
+    
+    # Percentiles
+    p50 = np.percentile(abs_errors, 50)
+    p90 = np.percentile(abs_errors, 90)
+    p95 = np.percentile(abs_errors, 95)
+    p99 = np.percentile(abs_errors, 99)
+    
+    # Build result dict
     result = {
-        'mape': None,
-        'median_ape': None,
-        'mape_samples': 0
+        'mae': float(mae),
+        'mse': float(mse),
+        'rmse': float(rmse),
+        'mape': float(mape),
+        'smape': float(smape),
+        'r2': float(r2),
+        'explained_variance': float(explained_variance),
+        'max_error': float(max_error),
+        'median_ae': float(median_ae),
+        'p50': float(p50),
+        'p90': float(p90),
+        'p95': float(p95),
+        'p99': float(p99),
+        'n_samples': n_samples
     }
     
-    try:
-        # Filter out samples where actual transit time is too small
-        # (to avoid exploding percentages when dividing by near-zero)
-        mask = y_true_hours > min_threshold
-        
-        if mask.sum() == 0:
-            # No samples with significant transit time
-            return result
-        
-        y_true_filtered = y_true_hours[mask]
-        y_pred_filtered = y_pred_hours[mask]
-        
-        # Calculate absolute percentage errors
-        ape_values = np.abs((y_pred_filtered - y_true_filtered) / y_true_filtered) * 100
-        
-        # Filter out extreme outliers (APE > 1000%)
-        # This can happen if predictions are way off
-        ape_values = ape_values[ape_values < 1000]
-        
-        if len(ape_values) == 0:
-            return result
-        
-        # Calculate MAPE and median APE
-        result['mape'] = float(np.mean(ape_values))
-        result['median_ape'] = float(np.median(ape_values))
-        result['mape_samples'] = int(len(ape_values))
-        
-        # Sanity check - if MAPE is still extreme, set to None
-        if result['mape'] > 500:
-            result['mape'] = None
-            result['median_ape'] = None
-    
-    except Exception as e:
-        print(f"Warning: Error calculating MAPE: {e}")
+    # Add prefix if specified
+    if prefix:
+        result = {f'{prefix}{k}': v for k, v in result.items()}
     
     return result
 
 
-def compute_selection_score(metrics, mae_weight=0.7, mape_weight=0.3):
+def compute_metrics_by_range(predictions: np.ndarray, targets: np.ndarray,
+                             ranges: List[Tuple[float, float]] = None) -> Dict[str, Dict[str, float]]:
     """
-    Compute composite score for model selection.
+    Compute metrics for different target value ranges
     
     Args:
-        metrics: dict with 'mae_hours' and optionally 'mape'
-        mae_weight: weight for MAE contribution (default 0.7)
-        mape_weight: weight for MAPE contribution (default 0.3)
+        predictions: Predicted values
+        targets: Target values
+        ranges: List of (min, max) tuples defining ranges. Default: [(0,1), (1,6), (6,24), (24,inf)]
     
     Returns:
-        Lower score = better model
+        Dict mapping range names to metrics
     """
-    mae = metrics.get('mae_hours', float('inf'))
+    preds = np.asarray(predictions).flatten()
+    targs = np.asarray(targets).flatten()
     
-    # Validate MAE
-    if mae is None or np.isnan(mae) or np.isinf(mae):
-        mae = float('inf')
+    if ranges is None:
+        ranges = [
+            (0, 1),      # 0-1 hours
+            (1, 6),      # 1-6 hours
+            (6, 24),     # 6-24 hours
+            (24, 72),    # 1-3 days
+            (72, float('inf'))  # 3+ days
+        ]
     
-    # Use MAPE only if available and valid
-    if (mape_weight > 0 and 
-        metrics.get('mape') is not None and 
-        not np.isnan(metrics['mape']) and 
-        not np.isinf(metrics['mape']) and
-        metrics.get('mape_samples', 0) > 10):  # Require at least 10 samples
-        mape = metrics['mape']
-        # Normalize MAPE to similar scale as MAE
-        # Typical MAPE: 0-200%, Typical MAE: 0-10 hours
-        # Scale MAPE by 0.05 to make 100% MAPE ≈ 5 hours equivalent
-        normalized_mape = mape * 0.05
-        score = mae * mae_weight + normalized_mape * mape_weight
-    else:
-        # Use MAE only (normalize weight to 1.0)
-        score = mae
+    results = {}
     
-    return score
+    for min_val, max_val in ranges:
+        mask = (targs >= min_val) & (targs < max_val)
+        
+        if mask.sum() > 0:
+            range_name = f'{min_val:.0f}-{max_val:.0f}h' if max_val < float('inf') else f'{min_val:.0f}+h'
+            results[range_name] = compute_metrics(preds[mask], targs[mask])
+            results[range_name]['count'] = int(mask.sum())
+            results[range_name]['percentage'] = float(mask.sum() / len(targs) * 100)
+    
+    return results
 
 
-def print_metrics(metrics, prefix=""):
+def compute_metrics_by_category(predictions: np.ndarray, targets: np.ndarray,
+                                categories: np.ndarray) -> Dict[str, Dict[str, float]]:
     """
-    Pretty print metrics with safe None handling
+    Compute metrics grouped by category
     
     Args:
-        metrics: Dictionary of metrics from compute_metrics
-        prefix: Optional prefix for print statements (e.g., "Train: ", "Val: ")
+        predictions: Predicted values
+        targets: Target values
+        categories: Category labels for each sample
+    
+    Returns:
+        Dict mapping category names to metrics
     """
-    print(f"\n{prefix}Metrics:")
-    print("="*60)
+    preds = np.asarray(predictions).flatten()
+    targs = np.asarray(targets).flatten()
+    cats = np.asarray(categories).flatten()
     
-    # Primary metrics
-    if 'mae_hours' in metrics and metrics['mae_hours'] is not None:
-        print(f"MAE (transit time):     {metrics['mae_hours']:.2f} hours")
+    unique_cats = np.unique(cats)
+    results = {}
     
-    if 'median_error' in metrics and metrics['median_error'] is not None:
-        print(f"Median AE:              {metrics['median_error']:.2f} hours")
+    for cat in unique_cats:
+        mask = cats == cat
+        if mask.sum() > 0:
+            cat_name = str(cat)
+            results[cat_name] = compute_metrics(preds[mask], targs[mask])
+            results[cat_name]['count'] = int(mask.sum())
     
-    if 'rmse_hours' in metrics and metrics['rmse_hours'] is not None:
-        print(f"RMSE:                   {metrics['rmse_hours']:.2f} hours")
+    return results
+
+
+def compute_directional_accuracy(predictions: np.ndarray, targets: np.ndarray,
+                                 threshold: float = 0.0) -> Dict[str, float]:
+    """
+    Compute directional/sign accuracy metrics
     
-    # Percentiles
-    if all(k in metrics for k in ['p25_error', 'p75_error', 'p90_error']):
-        if all(metrics[k] is not None for k in ['p25_error', 'p75_error', 'p90_error']):
-            print(f"\nError Distribution:")
-            print(f"  P25:  {metrics['p25_error']:.2f} hours")
-            print(f"  P50:  {metrics['median_error']:.2f} hours")
-            print(f"  P75:  {metrics['p75_error']:.2f} hours")
-            print(f"  P90:  {metrics['p90_error']:.2f} hours")
-            if 'p95_error' in metrics and metrics['p95_error'] is not None:
-                print(f"  P95:  {metrics['p95_error']:.2f} hours")
-            if 'p99_error' in metrics and metrics['p99_error'] is not None:
-                print(f"  P99:  {metrics['p99_error']:.2f} hours")
+    Args:
+        predictions: Predicted values
+        targets: Target values
+        threshold: Threshold for considering prediction correct
     
-    # MAPE if available
-    if metrics.get('mape') is not None:
-        print(f"\nMAPE (transit time):    {metrics['mape']:.2f}%")
-        if metrics.get('median_ape') is not None:
-            print(f"Median APE:             {metrics['median_ape']:.2f}%")
-        print(f"MAPE samples:           {metrics.get('mape_samples', 0)}")
-        print(f"  (calculated on transit times > 6 min)")
-    else:
-        print(f"\nMAPE:                   N/A (all transit times < 6 min)")
+    Returns:
+        Dict with directional accuracy metrics
+    """
+    preds = np.asarray(predictions).flatten()
+    targs = np.asarray(targets).flatten()
     
-    # R² and bias
-    if 'r2' in metrics and metrics['r2'] is not None:
-        print(f"\nR² Score:               {metrics['r2']:.4f}")
+    # Within threshold accuracy
+    within_threshold = np.abs(preds - targs) <= threshold
+    threshold_accuracy = np.mean(within_threshold) * 100
     
-    if 'mean_signed_error_hours' in metrics and metrics['mean_signed_error_hours'] is not None:
-        bias = metrics['mean_signed_error_hours']
-        if bias > 0:
-            bias_dir = "over-estimating transit time"
-        elif bias < 0:
-            bias_dir = "under-estimating transit time"
-        else:
-            bias_dir = "neutral"
-        print(f"Bias:                   {bias:+.2f} hours ({bias_dir})")
+    # Underestimate vs overestimate
+    underestimate = preds < targs
+    overestimate = preds > targs
+    exact = preds == targs
     
-    # Directional errors
-    if ('mae_hours_positive' in metrics and 'mae_hours_negative' in metrics and
-        metrics['mae_hours_positive'] is not None and metrics['mae_hours_negative'] is not None):
-        print(f"\nDirectional Errors:")
-        print(f"  Over-estimation:  {metrics['mae_hours_positive']:.2f} hours "
-              f"({metrics.get('n_positive_errors', 0)} samples)")
-        print(f"  Under-estimation: {metrics['mae_hours_negative']:.2f} hours "
-              f"({metrics.get('n_negative_errors', 0)} samples)")
+    return {
+        'threshold_accuracy': float(threshold_accuracy),
+        'underestimate_rate': float(np.mean(underestimate) * 100),
+        'overestimate_rate': float(np.mean(overestimate) * 100),
+        'exact_rate': float(np.mean(exact) * 100),
+        'mean_bias': float(np.mean(preds - targs)),  # Positive = overestimate
+    }
+
+
+def compute_time_based_metrics(predictions: np.ndarray, targets: np.ndarray,
+                               tolerance_hours: List[float] = None) -> Dict[str, float]:
+    """
+    Compute time-based accuracy metrics
     
-    print("="*60)
+    Args:
+        predictions: Predicted values in hours
+        targets: Target values in hours
+        tolerance_hours: List of tolerance thresholds in hours
+    
+    Returns:
+        Dict with accuracy at different tolerances
+    """
+    preds = np.asarray(predictions).flatten()
+    targs = np.asarray(targets).flatten()
+    
+    if tolerance_hours is None:
+        tolerance_hours = [0.5, 1.0, 2.0, 4.0, 6.0, 12.0, 24.0]
+    
+    abs_errors = np.abs(preds - targs)
+    
+    results = {}
+    for tol in tolerance_hours:
+        within_tol = abs_errors <= tol
+        accuracy = np.mean(within_tol) * 100
+        results[f'accuracy_within_{tol}h'] = float(accuracy)
+    
+    return results
 
 
 class EarlyStopping:
-    """Early stopping with best model tracking"""
+    """
+    Early stopping to stop training when validation metric stops improving
     
-    def __init__(self, patience=10, min_delta=0.0, mode='min', verbose=True):
+    Supports both minimization (loss) and maximization (accuracy, R²) modes
+    """
+    
+    def __init__(self, patience: int = 10, min_delta: float = 1e-4, 
+                 mode: str = 'min', verbose: bool = False):
         """
         Args:
-            patience: Number of epochs to wait for improvement
+            patience: Number of epochs to wait before stopping
             min_delta: Minimum change to qualify as improvement
-            mode: 'min' for loss (lower is better), 'max' for metrics like R² (higher is better)
+            mode: 'min' for loss (lower is better), 'max' for accuracy (higher is better)
             verbose: Whether to print messages
         """
         self.patience = patience
         self.min_delta = min_delta
         self.mode = mode
         self.verbose = verbose
-        self.counter = 0
-        self.best_score = None
-        self.early_stop = False
-        self.best_epoch = 0
         
-    def __call__(self, metric, epoch=None):
+        self.counter = 0
+        self.best_value = None
+        self.best_epoch = None
+        self.should_stop = False
+        self.history = []
+    
+    def __call__(self, value: float, epoch: int = None) -> bool:
         """
-        Check if should stop training
+        Check if training should stop
         
         Args:
-            metric: Current metric value
-            epoch: Current epoch number (optional, for logging)
+            value: Current metric value
+            epoch: Current epoch number (optional)
         
         Returns:
-            True if should stop, False otherwise
+            True if training should stop
         """
-        # Validate metric
-        if metric is None or np.isnan(metric) or np.isinf(metric):
-            if self.verbose:
-                print(f"  Warning: Invalid metric value: {metric}")
+        self.history.append(value)
+        
+        if self.best_value is None:
+            self.best_value = value
+            self.best_epoch = epoch or 0
             return False
         
-        score = float(metric)
+        # Check if improved
+        if self.mode == 'min':
+            improved = value < (self.best_value - self.min_delta)
+        else:  # mode == 'max'
+            improved = value > (self.best_value + self.min_delta)
         
-        if self.best_score is None:
-            self.best_score = score
-            if epoch is not None:
-                self.best_epoch = epoch
+        if improved:
             if self.verbose:
-                print(f"  Initial best score: {score:.4f}")
+                print(f"  EarlyStopping: Metric improved from {self.best_value:.6f} to {value:.6f}")
+            self.best_value = value
+            self.best_epoch = epoch or len(self.history) - 1
+            self.counter = 0
         else:
-            # Check improvement based on mode
-            if self.mode == 'min':
-                improved = score < (self.best_score - self.min_delta)
-            else:  # mode == 'max'
-                improved = score > (self.best_score + self.min_delta)
-            
-            if improved:
-                improvement = abs(score - self.best_score)
-                self.best_score = score
-                self.counter = 0
-                if epoch is not None:
-                    self.best_epoch = epoch
-                if self.verbose:
-                    print(f"  ✓ New best score: {score:.4f} (improved by {improvement:.4f})")
-            else:
-                self.counter += 1
-                if self.verbose:
-                    print(f"  No improvement for {self.counter}/{self.patience} epochs "
-                          f"(best: {self.best_score:.4f})")
-                
-                if self.counter >= self.patience:
-                    self.early_stop = True
-                    if self.verbose:
-                        print(f"\n  Early stopping triggered! Best epoch: {self.best_epoch}")
+            self.counter += 1
+            if self.verbose:
+                print(f"  EarlyStopping: No improvement. Counter: {self.counter}/{self.patience}")
         
-        return self.early_stop
+        if self.counter >= self.patience:
+            self.should_stop = True
+            if self.verbose:
+                print(f"  EarlyStopping: Triggered! Best value: {self.best_value:.6f} at epoch {self.best_epoch}")
+            return True
+        
+        return False
     
     def reset(self):
-        """Reset the early stopping state"""
+        """Reset early stopping state"""
         self.counter = 0
-        self.best_score = None
-        self.early_stop = False
-        self.best_epoch = 0
-
-
-def compute_classification_metrics(y_pred, y_true, threshold=1.0):
-    """
-    Compute classification metrics for transit time prediction.
-    Classify predictions as "fast" vs "slow" based on threshold.
+        self.best_value = None
+        self.best_epoch = None
+        self.should_stop = False
+        self.history = []
     
-    Args:
-        y_pred: Predicted transit times in hours
-        y_true: True transit times in hours
-        threshold: Threshold in hours to classify as slow (default 1.0)
-    
-    Returns:
-        Dictionary with classification metrics
-    """
-    # Flatten arrays
-    if y_pred.ndim > 1:
-        y_pred = y_pred.flatten()
-    if y_true.ndim > 1:
-        y_true = y_true.flatten()
-    
-    if len(y_pred) == 0:
+    def state_dict(self) -> Dict:
+        """Get state for serialization"""
         return {
-            'accuracy': 0.0,
-            'precision': 0.0,
-            'recall': 0.0,
-            'f1': 0.0,
-            'tp': 0,
-            'tn': 0,
-            'fp': 0,
-            'fn': 0,
-            'threshold_hours': float(threshold)
+            'patience': self.patience,
+            'min_delta': self.min_delta,
+            'mode': self.mode,
+            'counter': self.counter,
+            'best_value': self.best_value,
+            'best_epoch': self.best_epoch,
+            'should_stop': self.should_stop,
+            'history': self.history
         }
     
-    # Classify based on threshold
-    pred_slow = y_pred > threshold
-    true_slow = y_true > threshold
-    
-    # Confusion matrix components
-    tp = np.sum(pred_slow & true_slow)
-    tn = np.sum(~pred_slow & ~true_slow)
-    fp = np.sum(pred_slow & ~true_slow)
-    fn = np.sum(~pred_slow & true_slow)
-    
-    # Metrics
-    accuracy = (tp + tn) / len(y_true) if len(y_true) > 0 else 0
-    precision = tp / (tp + fp) if (tp + fp) > 0 else 0
-    recall = tp / (tp + fn) if (tp + fn) > 0 else 0
-    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
-    
-    return {
-        'accuracy': float(accuracy),
-        'precision': float(precision),
-        'recall': float(recall),
-        'f1': float(f1),
-        'tp': int(tp),
-        'tn': int(tn),
-        'fp': int(fp),
-        'fn': int(fn),
-        'threshold_hours': float(threshold)
-    }
+    def load_state_dict(self, state: Dict):
+        """Load state from dict"""
+        self.patience = state.get('patience', self.patience)
+        self.min_delta = state.get('min_delta', self.min_delta)
+        self.mode = state.get('mode', self.mode)
+        self.counter = state.get('counter', 0)
+        self.best_value = state.get('best_value', None)
+        self.best_epoch = state.get('best_epoch', None)
+        self.should_stop = state.get('should_stop', False)
+        self.history = state.get('history', [])
 
 
-def compare_models(metrics_dict):
+@dataclass
+class MetricTracker:
+    """Track metrics over training epochs"""
+    
+    metrics: Dict[str, List[float]] = field(default_factory=dict)
+    
+    def update(self, metric_dict: Dict[str, float], prefix: str = ''):
+        """Add metrics for current epoch"""
+        for key, value in metric_dict.items():
+            full_key = f'{prefix}{key}' if prefix else key
+            if full_key not in self.metrics:
+                self.metrics[full_key] = []
+            self.metrics[full_key].append(float(value))
+    
+    def get_best(self, metric_name: str, mode: str = 'min') -> Tuple[int, float]:
+        """Get best value and epoch for a metric"""
+        if metric_name not in self.metrics:
+            return -1, float('inf') if mode == 'min' else float('-inf')
+        
+        values = self.metrics[metric_name]
+        if mode == 'min':
+            best_idx = np.argmin(values)
+        else:
+            best_idx = np.argmax(values)
+        
+        return int(best_idx), float(values[best_idx])
+    
+    def get_last(self, metric_name: str) -> Optional[float]:
+        """Get last value for a metric"""
+        if metric_name not in self.metrics or len(self.metrics[metric_name]) == 0:
+            return None
+        return self.metrics[metric_name][-1]
+    
+    def get_history(self, metric_name: str) -> List[float]:
+        """Get full history for a metric"""
+        return self.metrics.get(metric_name, [])
+    
+    def get_summary(self) -> Dict[str, Dict[str, float]]:
+        """Get summary statistics for all metrics"""
+        summary = {}
+        for key, values in self.metrics.items():
+            if len(values) > 0:
+                summary[key] = {
+                    'min': float(np.min(values)),
+                    'max': float(np.max(values)),
+                    'mean': float(np.mean(values)),
+                    'std': float(np.std(values)),
+                    'last': float(values[-1]),
+                    'best_epoch_min': int(np.argmin(values)),
+                    'best_epoch_max': int(np.argmax(values)),
+                }
+        return summary
+    
+    def save(self, path: str):
+        """Save metrics to JSON file"""
+        with open(path, 'w') as f:
+            json.dump(self.metrics, f, indent=2)
+    
+    def load(self, path: str):
+        """Load metrics from JSON file"""
+        with open(path, 'r') as f:
+            self.metrics = json.load(f)
+    
+    def to_dataframe(self):
+        """Convert to pandas DataFrame"""
+        import pandas as pd
+        return pd.DataFrame(self.metrics)
+
+
+class RunningAverage:
+    """Compute running average of a metric"""
+    
+    def __init__(self):
+        self.total = 0.0
+        self.count = 0
+    
+    def update(self, value: float, n: int = 1):
+        """Update with new value(s)"""
+        self.total += value * n
+        self.count += n
+    
+    @property
+    def average(self) -> float:
+        """Get current average"""
+        return self.total / self.count if self.count > 0 else 0.0
+    
+    def reset(self):
+        """Reset the running average"""
+        self.total = 0.0
+        self.count = 0
+
+
+class ExponentialMovingAverage:
+    """Compute exponential moving average of a metric"""
+    
+    def __init__(self, alpha: float = 0.1):
+        """
+        Args:
+            alpha: Smoothing factor (0 < alpha <= 1). Higher = more weight on recent values
+        """
+        self.alpha = alpha
+        self.value = None
+    
+    def update(self, new_value: float):
+        """Update with new value"""
+        if self.value is None:
+            self.value = new_value
+        else:
+            self.value = self.alpha * new_value + (1 - self.alpha) * self.value
+    
+    @property
+    def average(self) -> float:
+        """Get current EMA value"""
+        return self.value if self.value is not None else 0.0
+    
+    def reset(self):
+        """Reset the EMA"""
+        self.value = None
+
+
+def print_metrics_table(metrics: Dict[str, float], title: str = "Metrics"):
     """
-    Compare multiple models and rank them
+    Print metrics in a formatted table
     
     Args:
-        metrics_dict: Dictionary mapping model names to their metrics
-                     e.g., {'model_v1': metrics1, 'model_v2': metrics2}
+        metrics: Dict of metric name to value
+        title: Table title
+    """
+    print(f"\n{'='*50}")
+    print(f"{title:^50}")
+    print(f"{'='*50}")
+    
+    max_key_len = max(len(k) for k in metrics.keys())
+    
+    for key, value in metrics.items():
+        if isinstance(value, float):
+            if abs(value) < 0.01 or abs(value) > 1000:
+                print(f"  {key:<{max_key_len}}: {value:.4e}")
+            else:
+                print(f"  {key:<{max_key_len}}: {value:.4f}")
+        else:
+            print(f"  {key:<{max_key_len}}: {value}")
+    
+    print(f"{'='*50}\n")
+
+
+def format_metrics_string(metrics: Dict[str, float], keys: List[str] = None,
+                          precision: int = 4) -> str:
+    """
+    Format metrics as a single-line string
+    
+    Args:
+        metrics: Dict of metrics
+        keys: Specific keys to include (default: all)
+        precision: Decimal precision
     
     Returns:
-        Sorted list of (model_name, score, metrics) tuples, best first
+        Formatted string like "mae=1.23, rmse=2.34, r2=0.89"
     """
-    results = []
+    if keys is None:
+        keys = list(metrics.keys())
     
-    for model_name, metrics in metrics_dict.items():
-        score = compute_selection_score(metrics)
-        results.append((model_name, score, metrics))
+    parts = []
+    for key in keys:
+        if key in metrics:
+            value = metrics[key]
+            if isinstance(value, float):
+                parts.append(f"{key}={value:.{precision}f}")
+            else:
+                parts.append(f"{key}={value}")
     
-    # Sort by score (lower is better)
-    results.sort(key=lambda x: x[1])
+    return ", ".join(parts)
+
+
+def compare_metrics(metrics1: Dict[str, float], metrics2: Dict[str, float],
+                    name1: str = "Model 1", name2: str = "Model 2") -> Dict[str, Dict]:
+    """
+    Compare two sets of metrics
     
-    print("\n" + "="*80)
-    print("MODEL COMPARISON")
-    print("="*80)
+    Args:
+        metrics1: First set of metrics
+        metrics2: Second set of metrics
+        name1: Name for first model
+        name2: Name for second model
     
-    for rank, (name, score, metrics) in enumerate(results, 1):
-        mae = metrics.get('mae_hours')
-        mape = metrics.get('mape')
+    Returns:
+        Dict with comparison results
+    """
+    all_keys = set(metrics1.keys()) | set(metrics2.keys())
+    
+    comparison = {}
+    for key in all_keys:
+        v1 = metrics1.get(key, None)
+        v2 = metrics2.get(key, None)
         
-        print(f"\n{rank}. {name}")
-        print(f"   Score: {score:.2f}")
-        
-        if mae is not None:
-            print(f"   MAE:   {mae:.2f} hours")
-        else:
-            print(f"   MAE:   N/A")
-        
-        if mape is not None:
-            print(f"   MAPE:  {mape:.2f}%")
-        else:
-            print(f"   MAPE:  N/A")
+        if v1 is not None and v2 is not None:
+            diff = v2 - v1
+            pct_change = (diff / abs(v1) * 100) if abs(v1) > 1e-8 else 0.0
+            
+            comparison[key] = {
+                name1: v1,
+                name2: v2,
+                'difference': diff,
+                'pct_change': pct_change,
+                'better': name2 if diff < 0 else name1  # Assumes lower is better
+            }
     
-    print("="*80 + "\n")
+    return comparison
+
+
+def save_metrics_report(metrics: Dict, filepath: str, include_timestamp: bool = True):
+    """
+    Save metrics report to file
     
-    return results
+    Args:
+        metrics: Metrics dict
+        filepath: Output file path
+        include_timestamp: Whether to include timestamp
+    """
+    from datetime import datetime
+    
+    report = {
+        'metrics': metrics
+    }
+    
+    if include_timestamp:
+        report['timestamp'] = datetime.now().isoformat()
+    
+    # Determine format from extension
+    ext = os.path.splitext(filepath)[1].lower()
+    
+    if ext == '.json':
+        with open(filepath, 'w') as f:
+            json.dump(report, f, indent=2, default=str)
+    elif ext == '.txt':
+        with open(filepath, 'w') as f:
+            f.write(f"Metrics Report\n")
+            if include_timestamp:
+                f.write(f"Generated: {report['timestamp']}\n")
+            f.write("="*50 + "\n\n")
+            for key, value in metrics.items():
+                f.write(f"{key}: {value}\n")
+    else:
+        # Default to JSON
+        with open(filepath, 'w') as f:
+            json.dump(report, f, indent=2, default=str)

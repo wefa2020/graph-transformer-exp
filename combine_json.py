@@ -17,7 +17,11 @@ def combine_json_files(input_dir='/home/ubuntu/graph-transformer-exp/data/graph-
     
     # Find all JSON files (excluding the output file if it exists)
     json_files = [
+<<<<<<< HEAD
         f for f in input_path.glob('*_1*.json') 
+=======
+        f for f in input_path.glob('*.json') 
+>>>>>>> 43a4a96 (large set 1)
         if f.name != output_file
     ]
     

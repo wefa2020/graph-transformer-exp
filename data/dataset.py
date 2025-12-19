@@ -1,5 +1,6 @@
 import torch
 from torch.utils.data import Dataset
+<<<<<<< HEAD
 from torch_geometric.data import Data, Batch
 from typing import List, Dict
 import numpy as np
@@ -37,10 +38,32 @@ class PackageLifecycleDataset(Dataset):
         progress_interval: int = 10000  # Print message every N items
     ):
         self.lifecycles_df = lifecycles_df
+=======
+from torch_geometric.data import Data
+import pandas as pd
+from typing import Optional
+
+from data.data_preprocessor import PackageLifecyclePreprocessor
+
+
+class PackageLifecycleDataset(Dataset):
+    """PyTorch Geometric Dataset for package lifecycle data"""
+    
+    def __init__(self, df: pd.DataFrame, preprocessor: PackageLifecyclePreprocessor,
+                 return_labels: bool = True):
+        """
+        Args:
+            df: DataFrame with package lifecycle data
+            preprocessor: Fitted PackageLifecyclePreprocessor
+            return_labels: Whether to include labels (for training/validation)
+        """
+        self.df = df.reset_index(drop=True)
+>>>>>>> 43a4a96 (large set 1)
         self.preprocessor = preprocessor
         self.return_labels = return_labels
         self.progress_interval = progress_interval
         
+<<<<<<< HEAD
         if num_workers is None:
             num_workers = max(1, mp.cpu_count() - 1)
         
@@ -130,33 +153,133 @@ class PackageLifecycleDataset(Dataset):
         print(f"   • Average speed: {total_items/total_time:.1f} items/sec")
         print(f"   • Time per item: {total_time/total_items*1000:.2f}ms")
         print(f"{'='*70}\n")
+=======
+        # Validate preprocessor is fitted
+        if not preprocessor.fitted:
+            raise ValueError("Preprocessor must be fitted before creating dataset")
+>>>>>>> 43a4a96 (large set 1)
     
     def __len__(self):
-        return len(self.processed_data)
+        return len(self.df)
     
     def __getitem__(self, idx):
-        data = self.processed_data[idx]
+        row = self.df.iloc[idx].to_dict()
         
-        # Convert to PyG Data object
-        x = torch.tensor(data['node_features'], dtype=torch.float)
-        edge_index = torch.tensor(data['edge_index'], dtype=torch.long)
-        edge_attr = torch.tensor(data['edge_features'], dtype=torch.float)
+        try:
+            processed = self.preprocessor.process_lifecycle(row, return_labels=self.return_labels)
+        except Exception as e:
+            print(f"Error processing package {row.get('package_id', idx)}: {e}")
+            raise
         
-        pyg_data = Data(
-            x=x,
-            edge_index=edge_index,
-            edge_attr=edge_attr,
-            num_nodes=data['num_nodes']
+        # Create PyG Data object
+        data = Data(
+            # === Node Features ===
+            node_continuous=torch.tensor(
+                processed['node_continuous_features'], dtype=torch.float32
+            ),
+            
+            # Node categorical indices
+            event_type_idx=torch.tensor(
+                processed['node_categorical_indices']['event_type'], dtype=torch.long
+            ),
+            from_location_idx=torch.tensor(
+                processed['node_categorical_indices']['from_location'], dtype=torch.long
+            ),
+            to_location_idx=torch.tensor(
+                processed['node_categorical_indices']['to_location'], dtype=torch.long
+            ),
+            to_postal_idx=torch.tensor(
+                processed['node_categorical_indices']['to_postal'], dtype=torch.long
+            ),
+            from_region_idx=torch.tensor(
+                processed['node_categorical_indices']['from_region'], dtype=torch.long
+            ),
+            to_region_idx=torch.tensor(
+                processed['node_categorical_indices']['to_region'], dtype=torch.long
+            ),
+            carrier_idx=torch.tensor(
+                processed['node_categorical_indices']['carrier'], dtype=torch.long
+            ),
+            leg_type_idx=torch.tensor(
+                processed['node_categorical_indices']['leg_type'], dtype=torch.long
+            ),
+            ship_method_idx=torch.tensor(
+                processed['node_categorical_indices']['ship_method'], dtype=torch.long
+            ),
+            
+            # Lookahead categorical indices
+            next_event_type_idx=torch.tensor(
+                processed['lookahead_categorical_indices']['next_event_type'], dtype=torch.long
+            ),
+            next_location_idx=torch.tensor(
+                processed['lookahead_categorical_indices']['next_location'], dtype=torch.long
+            ),
+            next_postal_idx=torch.tensor(
+                processed['lookahead_categorical_indices']['next_postal'], dtype=torch.long
+            ),
+            next_region_idx=torch.tensor(
+                processed['lookahead_categorical_indices']['next_region'], dtype=torch.long
+            ),
+            next_carrier_idx=torch.tensor(
+                processed['lookahead_categorical_indices']['next_carrier'], dtype=torch.long
+            ),
+            next_leg_type_idx=torch.tensor(
+                processed['lookahead_categorical_indices']['next_leg_type'], dtype=torch.long
+            ),
+            next_ship_method_idx=torch.tensor(
+                processed['lookahead_categorical_indices']['next_ship_method'], dtype=torch.long
+            ),
+            
+            # Package categorical
+            source_postal_idx=torch.tensor(
+                [processed['package_categorical']['source_postal']], dtype=torch.long
+            ),
+            dest_postal_idx=torch.tensor(
+                [processed['package_categorical']['dest_postal']], dtype=torch.long
+            ),
+            
+            # === Edge Features ===
+            edge_index=torch.tensor(processed['edge_index'], dtype=torch.long),
+            edge_continuous=torch.tensor(
+                processed['edge_continuous_features'], dtype=torch.float32
+            ),
+            
+            # Edge categorical indices
+            edge_from_location_idx=torch.tensor(
+                processed['edge_categorical_indices']['from_location'], dtype=torch.long
+            ),
+            edge_to_location_idx=torch.tensor(
+                processed['edge_categorical_indices']['to_location'], dtype=torch.long
+            ),
+            edge_to_postal_idx=torch.tensor(
+                processed['edge_categorical_indices']['to_postal'], dtype=torch.long
+            ),
+            edge_from_region_idx=torch.tensor(
+                processed['edge_categorical_indices']['from_region'], dtype=torch.long
+            ),
+            edge_to_region_idx=torch.tensor(
+                processed['edge_categorical_indices']['to_region'], dtype=torch.long
+            ),
+            edge_carrier_from_idx=torch.tensor(
+                processed['edge_categorical_indices']['carrier_from'], dtype=torch.long
+            ),
+            edge_carrier_to_idx=torch.tensor(
+                processed['edge_categorical_indices']['carrier_to'], dtype=torch.long
+            ),
+            edge_ship_method_from_idx=torch.tensor(
+                processed['edge_categorical_indices']['ship_method_from'], dtype=torch.long
+            ),
+            edge_ship_method_to_idx=torch.tensor(
+                processed['edge_categorical_indices']['ship_method_to'], dtype=torch.long
+            ),
+            
+            # Metadata
+            num_nodes=processed['num_nodes'],
+            package_id=processed['package_id']
         )
         
         if self.return_labels:
-            pyg_data.y = torch.tensor(data['labels'], dtype=torch.float)
-            pyg_data.label_mask = torch.tensor(data['label_mask'], dtype=torch.bool)
+            data.labels = torch.tensor(processed['labels'], dtype=torch.float32)
+            data.label_mask = torch.tensor(processed['label_mask'], dtype=torch.bool)
         
-        pyg_data.package_id = data['package_id']
-        
-        return pyg_data
-
-def collate_fn(batch):
-    """Custom collate function for batching"""
-    return Batch.from_data_list(batch)
+        return data
