@@ -1,13 +1,8 @@
 import torch
-<<<<<<< HEAD
-from dataclasses import dataclass, field
-from typing import List, Optional
-=======
 from dataclasses import dataclass, field, asdict
 from typing import List, Optional    
 from typing import Dict
 
->>>>>>> 43a4a96 (large set 1)
 
 @dataclass
 class NeptuneConfig:
@@ -30,6 +25,8 @@ class DataConfig:
         'INCORRECT_DIMENSION', 'PACKAGE_OPEN', 'COMPLETE_REVERSE_SHIPMENT'
     ])
     
+    cache_dir: str = 'data/cache'  # Cache directory
+
     # Features
     max_sequence_length: int = 20
     time_window_days: int = 30
@@ -47,23 +44,11 @@ class DataConfig:
 @dataclass
 class ModelConfig:
     """Model architecture configuration"""
-<<<<<<< HEAD
-    # Input dimensions
-    node_feature_dim: int = 256
-    edge_feature_dim: int = 64
-    hidden_dim: int = 256
-    
-    # Graph Transformer
-    num_layers: int = 40
-    num_heads: int = 8
-    dropout: float = 0.1
-=======
     
     # === Input Dimensions ===
     node_feature_dim: int = 256          # Total node feature dim (auto-computed)
     edge_feature_dim: int = 64           # Total edge feature dim (auto-computed)
     hidden_dim: int = 256                # Hidden dimension for transformer
->>>>>>> 43a4a96 (large set 1)
     
     # === Continuous Feature Dimensions (from preprocessor) ===
     node_continuous_dim: int = 30        # Continuous node features
@@ -145,7 +130,7 @@ class ModelConfig:
 @dataclass
 class TrainingConfig:
     """Training configuration"""
-    batch_size: int = 128
+    batch_size: int = 256
     num_epochs: int = 100
     learning_rate: float = 1e-4
     weight_decay: float = 1e-5
@@ -160,7 +145,7 @@ class TrainingConfig:
     
     # Device
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
-    num_workers: int = 30
+    num_workers: int = 60  #cpu*2
     
     # Checkpointing
     save_dir: str = "./checkpoints"

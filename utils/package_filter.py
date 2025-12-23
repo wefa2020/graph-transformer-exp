@@ -14,12 +14,13 @@ class PackageEventValidator:
     events for downstream consumption.
     
     Validation Rules:
-    1. All events must have valid event_time
-    2. leg_type must be 'FORWARD' for all non-DELIVERY events
-    3. Within each sort center, EXIT must come after INDUCT/LINEHAUL
-    4. If EXIT follows LINEHAUL, time difference must be >= 5 minutes
-    5. Each sort center must have exactly one INDUCT/LINEHAUL and one EXIT
-    6. At each event, abs(event_time - plan_time) must be <= 7 hours
+    1. package_id must start with 'TBA'
+    2. All events must have valid event_time
+    3. leg_type must be 'FORWARD' for all non-DELIVERY events
+    4. Within each sort center, EXIT must come after INDUCT/LINEHAUL
+    5. If EXIT follows LINEHAUL, time difference must be >= 5 minutes
+    6. Each sort center must have exactly one INDUCT/LINEHAUL and one EXIT
+    7. At each event, abs(event_time - plan_time) must be <= 7 hours
     
     Preprocessing:
     - Events are sorted by sort center and time
@@ -43,6 +44,7 @@ class PackageEventValidator:
         
         # Statistics tracking
         self.stats = {
+            'invalid_package_id': 0,
             'invalid_event_time': 0,
             'invalid_leg_type': 0,
             'exit_before_induct_linehaul': 0,
@@ -61,6 +63,25 @@ class PackageEventValidator:
         """Reset statistics counters"""
         for key in self.stats:
             self.stats[key] = 0
+    
+    @staticmethod
+    def validate_package_id(package_id: Union[str, None]) -> bool:
+        """
+        Validate that package_id starts with 'TBA'
+        
+        Args:
+            package_id: Package identifier
+            
+        Returns:
+            True if valid, False otherwise
+        """
+        if package_id is None:
+            return False
+        
+        if not isinstance(package_id, str):
+            package_id = str(package_id)
+        
+        return package_id.strip().upper().startswith('TBA')
     
     @staticmethod
     def parse_datetime(time_value: Union[str, datetime, None]) -> Union[datetime, None]:
@@ -132,7 +153,7 @@ class PackageEventValidator:
         
         return []
     
-    def validate_and_preprocess_events(self, events: List[Dict]) -> List[Dict]:
+    def validate_and_preprocess_events(self, events: List[Dict], package_id: str = None) -> List[Dict]:
         """
         Validate and preprocess events with sorting and problem field movement
         
@@ -143,6 +164,7 @@ class PackageEventValidator:
         
         Args:
             events: List of event dictionaries
+            package_id: Optional package ID for error messages
             
         Returns:
             Modified list of events with proper ordering and problems moved to previous nodes
@@ -497,7 +519,9 @@ class PackageEventValidator:
         Returns:
             Error category string
         """
-        if 'Invalid or missing event_time' in error_msg:
+        if 'package_id must start with' in error_msg or 'Invalid package_id' in error_msg:
+            return 'invalid_package_id'
+        elif 'Invalid or missing event_time' in error_msg:
             return 'invalid_event_time'
         elif 'leg_type' in error_msg.lower():
             return 'invalid_leg_type'
@@ -522,7 +546,7 @@ class PackageEventValidator:
         
         Args:
             packages: List of package dictionaries, each containing:
-                - package_id: str
+                - package_id: str (must start with 'TBA')
                 - events: List[Dict] - list of event dictionaries
                 - other package metadata (optional)
             verbose: Whether to print statistics
@@ -537,8 +561,8 @@ class PackageEventValidator:
         Example:
             >>> validator = PackageEventValidator()
             >>> packages = [
-            ...     {'package_id': 'PKG001', 'events': [...], 'weight': 10},
-            ...     {'package_id': 'PKG002', 'events': [...], 'weight': 15}
+            ...     {'package_id': 'TBA001', 'events': [...], 'weight': 10},
+            ...     {'package_id': 'TBA002', 'events': [...], 'weight': 15}
             ... ]
             >>> result = validator.filter_packages(packages)
             >>> valid = result['valid_packages']
@@ -556,8 +580,18 @@ class PackageEventValidator:
             package_id = package.get('package_id', f'unknown_{self.stats["total_processed"]}')
             
             try:
+                # STEP 0: Validate package_id starts with 'TBA'
+                if not self.validate_package_id(package_id):
+                    raise ValueError(
+                        f"Invalid package_id '{package_id}': package_id must start with 'TBA'. "
+                        f"Only TBA packages are supported."
+                    )
+                
                 # Validate and preprocess events
-                preprocessed_events = self.validate_and_preprocess_events(package['events'])
+                preprocessed_events = self.validate_and_preprocess_events(
+                    package['events'], 
+                    package_id=package_id
+                )
                 
                 # Create a copy of the package with preprocessed events
                 valid_package = package.copy()
@@ -634,6 +668,7 @@ class PackageEventValidator:
             print(f"Valid percentage: {valid_pct:.2f}%")
         
         print(f"\nFiltering reasons:")
+        print(f"  - Invalid package_id (not TBA*): {self.stats['invalid_package_id']}")
         print(f"  - Invalid event time: {self.stats['invalid_event_time']}")
         print(f"  - Invalid leg_type (not FORWARD): {self.stats['invalid_leg_type']}")
         print(f"  - EXIT before INDUCT/LINEHAUL: {self.stats['exit_before_induct_linehaul']}")
@@ -656,6 +691,7 @@ class PackageEventValidator:
             DataFrame with error categories and counts
         """
         error_categories = [
+            'invalid_package_id',
             'invalid_event_time',
             'invalid_leg_type',
             'exit_before_induct_linehaul',
@@ -680,14 +716,14 @@ class PackageEventValidator:
 
 # Example usage
 if __name__ == "__main__":
-    # Example 1: Basic usage with next_plan_time and leg_type validation
+    # Example 1: Basic usage with package_id validation
     print("="*60)
-    print("Example 1: Basic usage with leg_type validation")
+    print("Example 1: Basic usage with package_id validation")
     print("="*60)
     
     sample_packages = [
         {
-            'package_id': 'PKG001',
+            'package_id': 'TBA001',  # Valid: starts with TBA
             'weight': 10.5,
             'events': [
                 {
@@ -731,8 +767,48 @@ if __name__ == "__main__":
             ]
         },
         {
-            'package_id': 'PKG002',
+            'package_id': 'PKG002',  # Invalid: doesn't start with TBA
             'weight': 15.0,
+            'events': [
+                {
+                    'event_type': 'INDUCT',
+                    'event_time': '2024-01-01T10:00:00Z',
+                    'plan_time': '2024-01-01T10:00:00Z',
+                    'cpt': '2024-01-01T11:00:00Z',
+                    'sort_center': 'SC1',
+                    'leg_type': 'FORWARD'
+                },
+                {
+                    'event_type': 'EXIT',
+                    'event_time': '2024-01-01T11:00:00Z',
+                    'sort_center': 'SC1',
+                    'leg_type': 'FORWARD'
+                }
+            ]
+        },
+        {
+            'package_id': 'ABC123',  # Invalid: doesn't start with TBA
+            'weight': 8.0,
+            'events': [
+                {
+                    'event_type': 'INDUCT',
+                    'event_time': '2024-01-01T10:00:00Z',
+                    'plan_time': '2024-01-01T10:00:00Z',
+                    'cpt': '2024-01-01T11:00:00Z',
+                    'sort_center': 'SC1',
+                    'leg_type': 'FORWARD'
+                },
+                {
+                    'event_type': 'EXIT',
+                    'event_time': '2024-01-01T11:00:00Z',
+                    'sort_center': 'SC1',
+                    'leg_type': 'FORWARD'
+                }
+            ]
+        },
+        {
+            'package_id': 'TBA999',  # Valid TBA but invalid leg_type
+            'weight': 12.0,
             'events': [
                 {
                     'event_type': 'INDUCT',
@@ -751,22 +827,30 @@ if __name__ == "__main__":
             ]
         },
         {
-            'package_id': 'PKG003',
-            'weight': 8.0,
+            'package_id': 'tba456',  # Valid: case-insensitive TBA check
+            'weight': 5.0,
             'events': [
                 {
                     'event_type': 'INDUCT',
                     'event_time': '2024-01-01T10:00:00Z',
                     'plan_time': '2024-01-01T10:00:00Z',
                     'cpt': '2024-01-01T11:00:00Z',
-                    'sort_center': 'SC1'
-                    # Missing leg_type
+                    'sort_center': 'SC1',
+                    'carrier_id': 'C1',
+                    'leg_type': 'FORWARD'
                 },
                 {
                     'event_type': 'EXIT',
                     'event_time': '2024-01-01T11:00:00Z',
                     'sort_center': 'SC1',
+                    'carrier_id': 'C1',
                     'leg_type': 'FORWARD'
+                },
+                {
+                    'event_type': 'DELIVERY',
+                    'event_time': '2024-01-01T14:00:00Z',
+                    'plan_time': '2024-01-01T14:00:00Z',
+                    'carrier_id': 'C1'
                 }
             ]
         }
@@ -786,15 +870,11 @@ if __name__ == "__main__":
         print(f"\n  ✓ Valid: {pkg['package_id']}")
         for i, event in enumerate(pkg['events']):
             print(f"    Event {i}: {event['event_type']}")
-            print(f"      - event_time: {event.get('event_time')}")
-            print(f"      - plan_time: {event.get('plan_time')}")
-            print(f"      - cpt: {event.get('cpt')}")
-            print(f"      - leg_type: {event.get('leg_type')}")
             print(f"      - next_plan_time: {event.get('next_plan_time')}")
     
     for pkg in result['invalid_packages']:
-        print(f"  ✗ Invalid: {pkg['package_id']} - {pkg['error_category']}")
-        print(f"    Error: {pkg['error_message'][:100]}...")
+        print(f"\n  ✗ Invalid: {pkg['package_id']} - {pkg['error_category']}")
+        print(f"    Error: {pkg['error_message'][:80]}...")
     
     # Example 2: Using with DataFrame
     print("\n" + "="*60)
@@ -817,3 +897,13 @@ if __name__ == "__main__":
         print(error_summary.to_string(index=False))
     else:
         print("No errors found!")
+    
+    # Example 4: Test package_id validation directly
+    print("\n" + "="*60)
+    print("Example 4: Direct package_id validation")
+    print("="*60)
+    
+    test_ids = ['TBA001', 'tba002', 'TBA_123', 'PKG001', 'ABC123', None, '', '  TBA456  ']
+    for pid in test_ids:
+        is_valid = PackageEventValidator.validate_package_id(pid)
+        print(f"  '{pid}' -> {'✓ Valid' if is_valid else '✗ Invalid'}")
