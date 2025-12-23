@@ -44,6 +44,7 @@ logs/
 
 # Data files (large datasets)
 data/raw/
+data/graph-data
 data/processed/*.parquet
 data/processed/*.csv
 *.parquet
