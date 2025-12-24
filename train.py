@@ -41,7 +41,7 @@ def load_data(config) -> pd.DataFrame:
     print("="*80)
     
     # Load directly from JSON
-    data_path = getattr(config.data, 'source_file', 'data/graph-data/source.json')
+    data_path = getattr(config.data, 'source_file', 'data/graph-data/package_lifecycles_batch_2.json')
     df = pd.read_json(data_path)
     
     print(f"Loaded {len(df)} package lifecycles from {data_path}")

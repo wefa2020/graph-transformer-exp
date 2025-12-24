@@ -4,6 +4,18 @@ from typing import List, Optional
 from typing import Dict
 
 
+def get_sagemaker_paths():
+    """Get SageMaker paths if running in SageMaker"""
+    return {
+        'model_dir': os.environ.get('SM_MODEL_DIR', './model'),
+        'output_dir': os.environ.get('SM_OUTPUT_DATA_DIR', './output'),
+        'data_dir': os.environ.get('SM_CHANNEL_TRAINING', './data'),
+        'num_gpus': int(os.environ.get('SM_NUM_GPUS', torch.cuda.device_count())),
+        'num_cpus': int(os.environ.get('SM_NUM_CPUS', os.cpu_count())),
+        'hosts': os.environ.get('SM_HOSTS', '["localhost"]'),
+        'current_host': os.environ.get('SM_CURRENT_HOST', 'localhost'),
+    }
+
 @dataclass
 class NeptuneConfig:
     """Neptune database configuration"""
