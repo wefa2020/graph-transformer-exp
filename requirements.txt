@@ -1,5 +1,4 @@
-torch>=2.0.0
-torch-geometric>=2.3.0
+# Core packages (many pre-installed in SMD 3.6)
 numpy>=1.24.0
 pandas>=2.0.0
 scikit-learn>=1.3.0
@@ -7,9 +6,12 @@ matplotlib>=3.7.0
 seaborn>=0.12.0
 tqdm>=4.65.0
 boto3>=1.26.0
-gremlin-python>=3.6.0
 python-dateutil>=2.8.0
 pyyaml>=6.0
 tensorboard>=2.13.0
+
+# PyTorch Geometric - wheels for torch 2.5.0 + cu121
+--find-links https://data.pyg.org/whl/torch-2.5.0+cu121.html
 torch-scatter
 torch-sparse
+torch-geometric>=2.3.0

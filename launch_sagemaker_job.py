@@ -1,174 +1,212 @@
-# launch_sagemaker_job.py - Launch distributed training on SageMaker
+#!/usr/bin/env python3
+"""
+launch_sagemaker_job.py - Launch distributed training on SageMaker
+PyTorch 2.8.0 / Python 3.11
+"""
 
 import sagemaker
 from sagemaker.pytorch import PyTorch
 from sagemaker.debugger import TensorBoardOutputConfig
-import boto3
-from datetime import datetime
+import os
 
 
 def launch_distributed_training(
-    instance_type='ml.p3.16xlarge',  # 8 GPUs
+    instance_type='ml.p3.16xlarge',
     instance_count=1,
-    num_gpus_per_instance=8,
     source_dir='.',
     entry_point='sagemaker_train.py',
-    s3_data_path='s3://your-bucket/data/',
-    s3_output_path='s3://your-bucket/output/',
+    s3_data_path='s3://graph-transformer-exp/data/',
+    s3_output_path='s3://graph-transformer-exp/output/',
     role=None,
     max_run_hours=24,
-    hyperparameters=None
+    hyperparameters=None,
+    use_spot_instances=False,
+    max_wait_hours=48,
+    volume_size=100,
+    enable_tensorboard=True,
 ):
-    """
-    Launch distributed training job on SageMaker
+    """Launch distributed training job on SageMaker"""
     
-    Args:
-        instance_type: EC2 instance type (e.g., 'ml.p3.16xlarge', 'ml.p4d.24xlarge')
-        instance_count: Number of instances
-        num_gpus_per_instance: Number of GPUs per instance
-        source_dir: Directory containing training scripts
-        entry_point: Entry point script
-        s3_data_path: S3 path to training data
-        s3_output_path: S3 path for output
-        role: SageMaker execution role ARN
-        max_run_hours: Maximum training time in hours
-        hyperparameters: Training hyperparameters
-    """
-    
-    # Get SageMaker session and role
     session = sagemaker.Session()
     
     if role is None:
         role = sagemaker.get_execution_role()
     
-    # Default hyperparameters
     if hyperparameters is None:
         hyperparameters = {
             'epochs': 100,
-            'batch-size': 64,
-            'learning-rate': 1e-4,
+            'batch_size': 64,
+            'learning_rate': 1e-4,
+            'weight_decay': 0.01,
             'seed': 42,
+            'patience': 15,
+            'hidden_dim': 256,
+            'num_layers': 20,
+            'num_heads': 8,
+            'dropout': 0.1,
         }
     
-    # Calculate total GPUs
-    total_gpus = instance_count * num_gpus_per_instance
+    source_dir = os.path.abspath(source_dir)
+    entry_point_path = os.path.join(source_dir, entry_point)
     
-    # TensorBoard configuration
-    tensorboard_output_config = TensorBoardOutputConfig(
-        s3_output_path=f'{s3_output_path}/tensorboard',
-        container_local_output_path='/opt/ml/output/tensorboard'
-    )
+    if not os.path.exists(source_dir):
+        raise ValueError(f"Source directory does not exist: {source_dir}")
+    if not os.path.exists(entry_point_path):
+        raise ValueError(f"Entry point script does not exist: {entry_point_path}")
     
-    # Job name with timestamp
-    timestamp = datetime.now().strftime('%Y%m%d-%H%M%S')
-    job_name = f'package-event-prediction-{timestamp}'
-    
-    # Distribution configuration for SMDP
+    # Always enable torch_distributed - works for single and multi-GPU
     distribution = {
-        'smdistributed': {
-            'dataparallel': {
-                'enabled': True
-            }
+        'torch_distributed': {
+            'enabled': True
         }
     }
     
-    # Create PyTorch estimator
-    estimator = PyTorch(
-        entry_point=entry_point,
-        source_dir=source_dir,
-        role=role,
-        instance_type=instance_type,
-        instance_count=instance_count,
-        framework_version='2.0.1',  # or your PyTorch version
-        py_version='py310',
-        distribution=distribution,
-        hyperparameters=hyperparameters,
-        output_path=s3_output_path,
-        base_job_name=job_name,
-        max_run=max_run_hours * 3600,
-        tensorboard_output_config=tensorboard_output_config,
-        debugger_hook_config=False,  # Disable debugger for performance
-        
-        # Environment variables
-        environment={
-            'NCCL_DEBUG': 'INFO',
-            'NCCL_SOCKET_IFNAME': 'eth0',
-        },
-        
-        # Metric definitions for CloudWatch
-        metric_definitions=[
-            {'Name': 'train:loss', 'Regex': 'Train - Loss: ([0-9\\.]+)'},
-            {'Name': 'train:mae_hours', 'Regex': 'Train - Loss: [0-9\\.]+ MAE: ([0-9\\.]+)h'},
-            {'Name': 'val:loss', 'Regex': 'Val   - Loss: ([0-9\\.]+)'},
-            {'Name': 'val:mae_hours', 'Regex': 'Val   - Loss: [0-9\\.]+ MAE: ([0-9\\.]+)h'},
-            {'Name': 'val:r2', 'Regex': 'R²: ([0-9\\.]+)'},
-        ],
-    )
+    tensorboard_config = None
+    if enable_tensorboard:
+        tensorboard_config = TensorBoardOutputConfig(
+            s3_output_path=f'{s3_output_path.rstrip("/")}/tensorboard',
+            container_local_output_path='/opt/ml/output/tensorboard'
+        )
     
-    # Define input channels
-    inputs = {
-        'training': s3_data_path,
+    environment = {
+        'NCCL_DEBUG': 'INFO',
+        'NCCL_SOCKET_IFNAME': 'eth0',
+        'PYTORCH_CUDA_ALLOC_CONF': 'expandable_segments:True',
     }
     
-    print(f"="*80)
-    print(f"Launching SageMaker Distributed Training Job")
-    print(f"="*80)
-    print(f"Job name: {job_name}")
-    print(f"Instance type: {instance_type}")
-    print(f"Instance count: {instance_count}")
-    print(f"GPUs per instance: {num_gpus_per_instance}")
-    print(f"Total GPUs: {total_gpus}")
-    print(f"Data path: {s3_data_path}")
-    print(f"Output path: {s3_output_path}")
-    print(f"Hyperparameters: {hyperparameters}")
-    print(f"="*80)
+    metric_definitions = [
+        {'Name': 'train:loss', 'Regex': r'Train - Loss: ([0-9\.]+)'},
+        {'Name': 'train:mae', 'Regex': r'Train - Loss: [0-9\.]+, MAE: ([0-9\.]+)h'},
+        {'Name': 'val:loss', 'Regex': r'Val   - Loss: ([0-9\.]+)'},
+        {'Name': 'val:mae', 'Regex': r'Val   - Loss: [0-9\.]+, MAE: ([0-9\.]+)h'},
+        {'Name': 'val:r2', 'Regex': r'R²: ([0-9\.\-]+)'},
+        {'Name': 'test:mae', 'Regex': r'Test.*MAE: ([0-9\.]+)h'},
+        {'Name': 'test:r2', 'Regex': r'Test.*R²: ([0-9\.\-]+)'},
+    ]
     
-    # Start training
-    estimator.fit(inputs, job_name=job_name, wait=True)
+    estimator_kwargs = {
+        'entry_point': entry_point,
+        'source_dir': source_dir,
+        'role': role,
+        'instance_type': instance_type,
+        'instance_count': instance_count,
+        'framework_version': '2.5.1',
+        'py_version': 'py311',
+        'hyperparameters': hyperparameters,
+        'output_path': s3_output_path,
+        'base_job_name': 'pkg-event-pred',
+        'max_run': max_run_hours * 3600,
+        'environment': environment,
+        'metric_definitions': metric_definitions,
+        'volume_size': volume_size,
+        'debugger_hook_config': False,
+        'disable_profiler': True,
+        'distribution': distribution,
+    }
+    
+    if tensorboard_config:
+        estimator_kwargs['tensorboard_output_config'] = tensorboard_config
+    
+    if use_spot_instances:
+        estimator_kwargs['use_spot_instances'] = True
+        estimator_kwargs['max_wait'] = max_wait_hours * 3600
+    
+    estimator = PyTorch(**estimator_kwargs)
+    
+    inputs = {
+        'training': sagemaker.inputs.TrainingInput(
+            s3_data=s3_data_path,
+            content_type='application/json',
+        ),
+    }
+    
+    print("=" * 80)
+    print("SageMaker Distributed Training")
+    print("=" * 80)
+    print(f"PyTorch:        2.5.1")
+    print(f"Python:         py311")
+    print(f"Instance Type:  {instance_type}")
+    print(f"Instance Count: {instance_count}")
+    print(f"Volume Size:    {volume_size} GB")
+    print(f"Max Run Time:   {max_run_hours} hours")
+    print(f"Spot:           {use_spot_instances}")
+    print(f"Source Dir:     {source_dir}")
+    print(f"Entry Point:    {entry_point}")
+    print(f"Data Path:      {s3_data_path}")
+    print(f"Output Path:    {s3_output_path}")
+    print("-" * 80)
+    print("Hyperparameters:")
+    for k, v in hyperparameters.items():
+        print(f"  {k}: {v}")
+    print("=" * 80)
+    
+    estimator.fit(inputs, wait=True, logs='All')
     
     return estimator
-
-
-def launch_multi_node_training(
-    instance_type='ml.p3.16xlarge',
-    instance_count=2,  # Multi-node
-    **kwargs
-):
-    """Launch multi-node distributed training"""
-    return launch_distributed_training(
-        instance_type=instance_type,
-        instance_count=instance_count,
-        **kwargs
-    )
 
 
 if __name__ == '__main__':
     import argparse
     
     parser = argparse.ArgumentParser(description='Launch SageMaker distributed training')
-    parser.add_argument('--instance-type', type=str, default='ml.p3.16xlarge')
-    parser.add_argument('--instance-count', type=int, default=1)
+    
+    # Required
     parser.add_argument('--s3-data', type=str, required=True, help='S3 path to training data')
     parser.add_argument('--s3-output', type=str, required=True, help='S3 path for output')
-    parser.add_argument('--role', type=str, default=None, help='SageMaker execution role')
+    
+    # Instance
+    parser.add_argument('--instance-type', type=str, default='ml.p3.16xlarge')
+    parser.add_argument('--instance-count', type=int, default=1)
+    parser.add_argument('--volume-size', type=int, default=100)
+    
+    # Training
     parser.add_argument('--epochs', type=int, default=100)
     parser.add_argument('--batch-size', type=int, default=64)
     parser.add_argument('--learning-rate', type=float, default=1e-4)
+    parser.add_argument('--hidden-dim', type=int, default=256)
+    parser.add_argument('--num-layers', type=int, default=20)
+    parser.add_argument('--num-heads', type=int, default=8)
+    parser.add_argument('--dropout', type=float, default=0.1)
+    parser.add_argument('--seed', type=int, default=42)
+    
+    # Source
+    parser.add_argument('--source-dir', type=str, default='.')
+    parser.add_argument('--entry-point', type=str, default='sagemaker_train.py')
+    
+    # Optional
+    parser.add_argument('--role', type=str, default=None)
+    parser.add_argument('--use-spot', action='store_true')
+    parser.add_argument('--max-run-hours', type=int, default=24)
+    parser.add_argument('--max-wait-hours', type=int, default=48)
+    parser.add_argument('--no-tensorboard', action='store_true')
     
     args = parser.parse_args()
     
     hyperparameters = {
         'epochs': args.epochs,
-        'batch-size': args.batch_size,
-        'learning-rate': args.learning_rate,
-        'seed': 42,
+        'batch_size': args.batch_size,
+        'learning_rate': args.learning_rate,
+        'weight_decay': 0.01,
+        'seed': args.seed,
+        'patience': 15,
+        'hidden_dim': args.hidden_dim,
+        'num_layers': args.num_layers,
+        'num_heads': args.num_heads,
+        'dropout': args.dropout,
     }
     
-    estimator = launch_distributed_training(
+    launch_distributed_training(
         instance_type=args.instance_type,
         instance_count=args.instance_count,
         s3_data_path=args.s3_data,
         s3_output_path=args.s3_output,
         role=args.role,
         hyperparameters=hyperparameters,
+        source_dir=args.source_dir,
+        entry_point=args.entry_point,
+        use_spot_instances=args.use_spot,
+        max_run_hours=args.max_run_hours,
+        max_wait_hours=args.max_wait_hours,
+        volume_size=args.volume_size,
+        enable_tensorboard=not args.no_tensorboard,
     )
