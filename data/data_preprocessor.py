@@ -28,11 +28,12 @@ class PackageLifecyclePreprocessor:
     - Only used for to_postal when predicting DELIVERY time
     """
     
-    def __init__(self, config, distance_file_path: str = None):
+    def __init__(self, config, distance_df: pd.DataFrame = None, distance_file_path: str = None):
         """
         Args:
             config: Configuration object with data.event_types and data.problem_types
-            distance_file_path: Path to location_distances_complete.csv
+            distance_df: Pre-loaded DataFrame with distance data (for distributed training)
+            distance_file_path: Path to location_distances_complete.csv (used if distance_df not provided)
         """
         self.config = config
         
@@ -41,10 +42,11 @@ class PackageLifecyclePreprocessor:
         self.region_lookup = {}
         self.distance_unit = 'miles'
         
-        self.distance_file_path = distance_file_path or os.path.join(
-            'data', 'location_distances_complete.csv'
-        )
-        self._load_distance_data()
+        # Store for serialization - only store file path, not the DataFrame
+        self.distance_file_path = distance_file_path
+        
+        # Load distance data from DataFrame or file
+        self._load_distance_data(distance_df=distance_df)
         
         # === Categorical Encoders ===
         self.event_type_encoder = LabelEncoder()
@@ -84,16 +86,60 @@ class PackageLifecyclePreprocessor:
     
     # ==================== Distance Data Loading ====================
     
-    def _load_distance_data(self):
-        """Load distance and region lookup tables from CSV"""
-        try:
-            if not os.path.exists(self.distance_file_path):
+    def _load_distance_data(self, distance_df: pd.DataFrame = None):
+        """
+        Load distance and region lookup tables.
+        
+        Args:
+            distance_df: Pre-loaded DataFrame (takes priority if provided)
+        """
+        df_dist = None
+        
+        # Priority 1: Use provided DataFrame
+        if distance_df is not None:
+            df_dist = distance_df
+            print("Using provided distance DataFrame")
+        
+        # Priority 2: Load from file path
+        elif self.distance_file_path is not None:
+            if os.path.exists(self.distance_file_path):
+                try:
+                    df_dist = pd.read_csv(self.distance_file_path)
+                    print(f"Loaded distance data from: {self.distance_file_path}")
+                except Exception as e:
+                    print(f"Error loading distance file: {e}")
+            else:
                 print(f"Warning: Distance file not found at {self.distance_file_path}")
-                print("Distance features will be set to 0")
-                return
-            
-            df_dist = pd.read_csv(self.distance_file_path)
-            
+        
+        # Priority 3: Try default path
+        else:
+            default_path = os.path.join('data', 'location_distances_complete.csv')
+            if os.path.exists(default_path):
+                try:
+                    df_dist = pd.read_csv(default_path)
+                    self.distance_file_path = default_path
+                    print(f"Loaded distance data from default path: {default_path}")
+                except Exception as e:
+                    print(f"Error loading default distance file: {e}")
+            else:
+                print("Warning: No distance data available. Distance features will be set to 0")
+        
+        # If no data available, return early
+        if df_dist is None:
+            print("Distance features will be set to 0")
+            return
+        
+        # Process the DataFrame
+        self._process_distance_dataframe(df_dist)
+    
+    def _process_distance_dataframe(self, df_dist: pd.DataFrame):
+        """
+        Process distance DataFrame and populate lookup tables.
+        
+        Args:
+            df_dist: DataFrame with distance data
+        """
+        try:
             # Validate columns
             required_cols = ['location_id_1', 'location_id_2']
             if not all(col in df_dist.columns for col in required_cols):
@@ -112,7 +158,7 @@ class PackageLifecyclePreprocessor:
                 print("Warning: No distance column found")
                 return
             
-            print(f"Loading distances using '{dist_col}' column")
+            print(f"Processing distances using '{dist_col}' column")
             
             # Build lookups
             for _, row in df_dist.iterrows():
@@ -158,7 +204,7 @@ class PackageLifecyclePreprocessor:
                 print(f"Regions found: {sorted(regions)}")
                 
         except Exception as e:
-            print(f"Error loading distance file: {e}")
+            print(f"Error processing distance data: {e}")
             import traceback
             traceback.print_exc()
     
@@ -1247,11 +1293,38 @@ class PackageLifecyclePreprocessor:
     
     # ==================== Utility Methods ====================
     
-    def inverse_transform_time(self, scaled_time: np.ndarray) -> np.ndarray:
-        """Convert scaled transit time back to hours"""
-        if self.config.data.normalize_time:
-            return self.label_time_scaler.inverse_transform(scaled_time)
-        return scaled_time
+    def inverse_transform_time(self, scaled_time):
+        """Convert scaled time back to hours
+        
+        Args:
+            scaled_time: Scaled time values (can be 1D or 2D array)
+            
+        Returns:
+            Time in hours (same shape as input)
+        """
+        if scaled_time is None:
+            return None
+        
+        # Convert to numpy if needed
+        if hasattr(scaled_time, 'numpy'):
+            scaled_time = scaled_time.numpy()
+        elif not isinstance(scaled_time, np.ndarray):
+            scaled_time = np.array(scaled_time)
+        
+        # Handle scalar
+        if scaled_time.ndim == 0:
+            scaled_time = scaled_time.reshape(1, 1)
+            result = self.label_time_scaler.inverse_transform(scaled_time)
+            return result.item()
+        
+        # Handle 1D array
+        if scaled_time.ndim == 1:
+            scaled_time_2d = scaled_time.reshape(-1, 1)
+            result = self.label_time_scaler.inverse_transform(scaled_time_2d)
+            return result.flatten()
+        
+        # Already 2D
+        return self.label_time_scaler.inverse_transform(scaled_time)
     
     def get_feature_dimensions(self) -> Dict[str, int]:
         """Get dimensions of all feature components"""
