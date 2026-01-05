@@ -71,7 +71,7 @@ def parse_args():
     parser = argparse.ArgumentParser()
     
     # Training
-    parser.add_argument('--epochs', type=int, default=100)
+    parser.add_argument('--epochs', type=int, default=200)
     parser.add_argument('--batch_size', type=int, default=64)
     parser.add_argument('--learning_rate', type=float, default=1e-4)
     parser.add_argument('--weight_decay', type=float, default=0.01)
@@ -106,19 +106,15 @@ def parse_args():
     # S3 Cache
     parser.add_argument('--cache_dir', type=str, default="s3://graph-transformer-exp/cache/",
                         help='S3 path for H5 cache (e.g., s3://bucket/path/)')
-    parser.add_argument('--load_from_cache', type=bool, default=False)
-    parser.add_argument('--save_to_cache', type=bool, default=True)
+    parser.add_argument('--load_from_cache', type=bool, default=True)
+    parser.add_argument('--save_to_cache', type=bool, default=False)
     
     # Distributed
     parser.add_argument('--find_unused_parameters', action='store_true', default=False)
     parser.add_argument('--checkpoint_frequency', type=int, default=5)
     parser.add_argument('--num_workers', type=int, default=4)
     
-    # AMP settings
-    parser.add_argument('--amp_init_scale', type=float, default=1024.0,
-                        help='Initial scale for GradScaler (default: 2^10=1024)')
-    parser.add_argument('--amp_growth_interval', type=int, default=2000,
-                        help='Growth interval for GradScaler')
+    # AMP (autocast only, no grad scaling)
     parser.add_argument('--disable_amp', action='store_true', default=False,
                         help='Disable automatic mixed precision')
     
@@ -386,18 +382,21 @@ def load_and_prepare_data(args, rank, local_rank, world_size, log):
     train_dataset = PackageLifecycleDataset(
         h5_cache_path=train_cache,
         load_from_cache=True,
+        save_to_cache =False,
         log_fn=log_fn
     )
     
     val_dataset = PackageLifecycleDataset(
         h5_cache_path=val_cache,
         load_from_cache=True,
+        save_to_cache =False,
         log_fn=log_fn
     )
     
     test_dataset = PackageLifecycleDataset(
         h5_cache_path=test_cache,
         load_from_cache=True,
+        save_to_cache =False,
         log_fn=log_fn
     )
     
@@ -476,8 +475,8 @@ def create_model(preprocessor, args, device, local_rank, world_size, rank):
         embed_dim=args.embed_dim,
         output_dim=1,
         use_edge_features=True,
-        use_global_attention=True,
-        use_positional_encoding=True
+        use_global_attention=False,
+        use_positional_encoding=False
     )
     
     model = EventTimePredictor(model_config, vocab_sizes).to(device)
@@ -594,8 +593,8 @@ def diagnose_batch(model, batch, device, rank, use_amp=True):
 
 
 def train_epoch(model, loader, optimizer, criterion, device, preprocessor,
-                scaler=None, grad_accum=1, rank=0, world_size=1, max_grad_norm=1.0,
-                epoch=1):
+                grad_accum=1, rank=0, world_size=1, max_grad_norm=1.0,
+                epoch=1, use_amp=True):
     model.train()
     total_loss, total_samples = 0.0, 0
     all_preds, all_targets = [], []
@@ -605,7 +604,6 @@ def train_epoch(model, loader, optimizer, criterion, device, preprocessor,
     skipped_steps_due_to_nan = 0
     skipped_due_to_invalid_loss = 0
     
-    use_amp = scaler is not None
     is_ddp = world_size > 1 and hasattr(model, 'no_sync')
     num_batches = len(loader)
     
@@ -634,6 +632,7 @@ def train_epoch(model, loader, optimizer, criterion, device, preprocessor,
         ctx = model.no_sync() if (is_ddp and not should_sync) else nullcontext()
         
         with ctx:
+            # Use autocast for forward pass (memory savings)
             with torch.amp.autocast('cuda', enabled=use_amp):
                 preds = model(batch)
                 mask = batch.label_mask
@@ -661,7 +660,8 @@ def train_epoch(model, loader, optimizer, criterion, device, preprocessor,
                         log.warning(f"  Batch {batch_idx}: NaN/Inf in targets, skipping")
                     continue
                 
-                loss = criterion(masked_preds, masked_targets)
+                # Compute loss in float32 for stability
+                loss = criterion(masked_preds.float(), masked_targets.float())
                 
                 # Check for NaN/Inf in loss
                 if torch.isnan(loss) or torch.isinf(loss):
@@ -672,10 +672,8 @@ def train_epoch(model, loader, optimizer, criterion, device, preprocessor,
                 
                 scaled_loss = loss / grad_accum
             
-            if scaler:
-                scaler.scale(scaled_loss).backward()
-            else:
-                scaled_loss.backward()
+            # Backward pass (outside autocast for full precision gradients)
+            scaled_loss.backward()
         
         valid_batches += 1
         bs = masked_preds.size(0)
@@ -683,42 +681,24 @@ def train_epoch(model, loader, optimizer, criterion, device, preprocessor,
         accumulated_samples += bs
         
         # Store predictions for metrics
-        all_preds.append(preprocessor.inverse_transform_time(masked_preds.detach().cpu().numpy()))
-        all_targets.append(preprocessor.inverse_transform_time(masked_targets.cpu().numpy()))
+        all_preds.append(preprocessor.inverse_transform_time(masked_preds.detach().float().cpu().numpy()))
+        all_targets.append(preprocessor.inverse_transform_time(masked_targets.float().cpu().numpy()))
         
         if should_sync:
-            if scaler:
-                # Unscale gradients
-                scaler.unscale_(optimizer)
-                
-                # Compute gradient norm
-                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
-                
-                # Check for NaN/Inf gradients
-                if torch.isnan(grad_norm) or torch.isinf(grad_norm):
-                    skipped_steps_due_to_nan += 1
-                    if rank == 0 and skipped_steps_due_to_nan <= 5:
-                        log.warning(f"  Step {batch_idx}: Gradient norm is {grad_norm}, skipping optimizer step")
-                    optimizer.zero_grad()
-                    scaler.update()
-                    continue
-                
-                # Perform optimizer step
-                scaler.step(optimizer)
-                scaler.update()
-                num_optimizer_steps += 1
-                
-            else:
-                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
-                
-                if torch.isnan(grad_norm) or torch.isinf(grad_norm):
-                    skipped_steps_due_to_nan += 1
-                    optimizer.zero_grad()
-                    continue
-                
-                optimizer.step()
-                num_optimizer_steps += 1
+            # Compute gradient norm and clip
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
             
+            # Check for NaN/Inf gradients
+            if torch.isnan(grad_norm) or torch.isinf(grad_norm):
+                skipped_steps_due_to_nan += 1
+                if rank == 0 and skipped_steps_due_to_nan <= 5:
+                    log.warning(f"  Step {batch_idx}: Gradient norm is {grad_norm}, skipping optimizer step")
+                optimizer.zero_grad()
+                continue
+            
+            # Perform optimizer step
+            optimizer.step()
+            num_optimizer_steps += 1
             optimizer.zero_grad()
             
             # Accumulate totals
@@ -779,7 +759,8 @@ def validate(model, loader, criterion, device, preprocessor, use_amp=True):
         if torch.isnan(masked_preds).any() or torch.isinf(masked_preds).any():
             continue
         
-        loss = criterion(masked_preds, masked_targets)
+        # Compute loss in float32
+        loss = criterion(masked_preds.float(), masked_targets.float())
         
         if torch.isnan(loss) or torch.isinf(loss):
             continue
@@ -788,8 +769,8 @@ def validate(model, loader, criterion, device, preprocessor, use_amp=True):
         total_loss += loss.item() * bs
         total_samples += bs
         
-        all_preds.append(preprocessor.inverse_transform_time(masked_preds.cpu().numpy()))
-        all_targets.append(preprocessor.inverse_transform_time(masked_targets.cpu().numpy()))
+        all_preds.append(preprocessor.inverse_transform_time(masked_preds.float().cpu().numpy()))
+        all_targets.append(preprocessor.inverse_transform_time(masked_targets.float().cpu().numpy()))
     
     if total_samples == 0:
         return {'loss': float('inf'), 'mae': float('inf'), 'rmse': float('inf'), 'mape': 0.0, 'r2': 0.0}
@@ -799,7 +780,7 @@ def validate(model, loader, criterion, device, preprocessor, use_amp=True):
     return metrics
 
 
-def save_checkpoint(model, optimizer, scheduler, scaler, epoch, metrics,
+def save_checkpoint(model, optimizer, scheduler, epoch, metrics,
                     model_config, vocab_sizes, save_path, is_best=False):
     model_to_save = model.module if hasattr(model, 'module') else model
     checkpoint = {
@@ -807,7 +788,6 @@ def save_checkpoint(model, optimizer, scheduler, scaler, epoch, metrics,
         'model_state_dict': model_to_save.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
         'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
-        'scaler_state_dict': scaler.state_dict() if scaler else None,
         'model_config': model_config.to_dict(),
         'vocab_sizes': vocab_sizes,
         'metrics': metrics,
@@ -832,13 +812,14 @@ def main():
     
     log = get_logger(rank)
     
+    use_amp = not args.disable_amp
+    
     log.info("=" * 60)
     log.info("DISTRIBUTED TRAINING")
     log.info("=" * 60)
     log.info(f"  World size: {world_size}, Rank: {rank}, Device: {device}")
     log.info(f"  S3 cache: {args.cache_dir}")
-    log.info(f"  AMP enabled: {not args.disable_amp}")
-    log.info(f"  AMP init scale: {args.amp_init_scale}")
+    log.info(f"  AMP (autocast): {use_amp}")
     log.info(f"  Warmup epochs: {args.warmup_epochs}")
     log.info("=" * 60)
     
@@ -875,23 +856,6 @@ def main():
         
         # Early stopping
         early_stopping = EarlyStopping(patience=args.patience, min_delta=args.min_delta)
-        
-        # GradScaler with lower initial scale to prevent overflow
-        if args.disable_amp:
-            scaler = None
-            use_amp = False
-            log.info("AMP disabled")
-        else:
-            scaler = torch.amp.GradScaler(
-                'cuda',
-                init_scale=args.amp_init_scale,
-                growth_factor=2.0,
-                backoff_factor=0.5,
-                growth_interval=args.amp_growth_interval,
-                enabled=True
-            )
-            use_amp = True
-            log.info(f"GradScaler initialized with scale={args.amp_init_scale}")
         
         # Learning rate scheduler with warmup
         warmup_epochs = args.warmup_epochs
@@ -945,8 +909,8 @@ def main():
             # Training
             train_metrics = train_epoch(
                 model, train_loader, optimizer, criterion, device, preprocessor,
-                scaler, args.gradient_accumulation_steps, rank, world_size,
-                max_grad_norm=args.max_grad_norm, epoch=epoch
+                args.gradient_accumulation_steps, rank, world_size,
+                max_grad_norm=args.max_grad_norm, epoch=epoch, use_amp=use_amp
             )
             sync_barrier(device)
             
@@ -990,9 +954,6 @@ def main():
             log.info(f"  Val   - Loss: {val_metrics['loss']:.4f}, MAE: {val_metrics['mae']:.2f}h, R²: {val_metrics['r2']:.4f}")
             log.info(f"  Steps - Optimizer: {epoch_optimizer_steps}, Total: {total_optimizer_steps}")
             
-            if scaler is not None:
-                log.info(f"  Scaler - Scale: {scaler.get_scale():.1f}")
-            
             # Warnings for potential issues
             if train_metrics.get('skipped_batches', 0) > 0:
                 log.warning(f"  ⚠ Skipped {train_metrics['skipped_batches']} batches (empty predictions)")
@@ -1005,9 +966,6 @@ def main():
             
             if epoch_optimizer_steps == 0:
                 log.warning(f"  ⚠ No optimizer steps this epoch! Check data/model.")
-                # If no steps for multiple epochs, suggest disabling AMP
-                if epoch >= 3 and total_optimizer_steps == 0:
-                    log.warning(f"  ⚠ Consider running with --disable_amp or lower --amp_init_scale")
             
             # Save best model
             if rank == 0:
@@ -1020,7 +978,7 @@ def main():
                     best_epoch = epoch
                     
                     save_checkpoint(
-                        model, optimizer, scheduler, scaler, epoch,
+                        model, optimizer, scheduler, epoch,
                         {'val_loss': val_loss, 'val_mae': val_mae, 'val_r2': val_metrics['r2']},
                         model_config, vocab_sizes,
                         os.path.join(args.model_dir, 'best_model.pt'), is_best=True
@@ -1030,7 +988,7 @@ def main():
                 # Periodic checkpoint
                 if epoch % args.checkpoint_frequency == 0:
                     save_checkpoint(
-                        model, optimizer, scheduler, scaler, epoch,
+                        model, optimizer, scheduler, epoch,
                         {'val_loss': val_loss, 'val_mae': val_mae},
                         model_config, vocab_sizes,
                         os.path.join(args.model_dir, f'checkpoint_epoch_{epoch}.pt')
