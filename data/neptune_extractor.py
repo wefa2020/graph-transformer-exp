@@ -111,6 +111,7 @@ def _extract_package_edges(gremlin_client, package_id: str) -> Optional[Dict]:
             'package_id': package_id,
             'source_postal': package_props.get('source_postal_code'),
             'dest_postal': package_props.get('destination_postal_code'),
+            'leg_plan':package_props.get('leg_plan'),
             'pdd': package_props.get('pdd'),
             'weight': package_props.get('weight', 0),
             'length': package_props.get('length', 0),
