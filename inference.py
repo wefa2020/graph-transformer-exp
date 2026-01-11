@@ -23,7 +23,7 @@ from models.event_predictor import EventTimePredictor
 from data.data_preprocessor import PackageLifecyclePreprocessor
 from data.neptune_extractor import (
     NeptuneDataExtractor,
-    _extract_package_edges,
+    _extract_package_edges_optimized,
     _validate_package_sequence,
     _deduplicate_events
 )
@@ -34,6 +34,7 @@ from data.neptune_extractor import (
 # ============================================================================
 
 PACKAGE_IDS = [
+    "TBA325968945926",
     "TBA327582930610",
     "TBA326599241029",
     "TBA326755394001",
@@ -155,7 +156,7 @@ class EventTimeInference:
     def fetch_package(self, package_id: str) -> Optional[Dict]:
         """Fetch package from Neptune."""
         try:
-            package_data = _extract_package_edges(self.extractor.main_client, package_id)
+            package_data = _extract_package_edges_optimized(self.extractor.main_client, package_id)
             
             if package_data is None:
                 return None

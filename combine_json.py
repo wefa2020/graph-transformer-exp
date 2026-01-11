@@ -1,11 +1,12 @@
+
 import json
 import os
 from pathlib import Path
 from tqdm import tqdm
 
-def combine_json_files(input_dir='/home/ubuntu/graph-transformer-exp/data/graph-data', output_file='source.json'):
+def combine_json_files(input_dir='/home/ubuntu/graph-transformer-exp/data/graph-data/12100106/', output_file='all.json'):
     """
-    Combine all JSON files in a directory into one source.json file
+    Combine all JSON files in a directory into one all.json file
     
     Args:
         input_dir: Directory containing JSON files
@@ -17,11 +18,7 @@ def combine_json_files(input_dir='/home/ubuntu/graph-transformer-exp/data/graph-
     
     # Find all JSON files (excluding the output file if it exists)
     json_files = [
-<<<<<<< HEAD
-        f for f in input_path.glob('*_1*.json') 
-=======
         f for f in input_path.glob('*.json') 
->>>>>>> 43a4a96 (large set 1)
         if f.name != output_file
     ]
     

@@ -104,15 +104,15 @@ def parse_args():
     parser.add_argument('--data_file', type=str, default='source.json')
     
     # S3 Cache
-    parser.add_argument('--cache_dir', type=str, default="s3://graph-transformer-exp/cache/",
+    parser.add_argument('--cache_dir', type=str, default="s3://graph-transformer-exp/cache000/",
                         help='S3 path for H5 cache (e.g., s3://bucket/path/)')
-    parser.add_argument('--load_from_cache', type=bool, default=True)
-    parser.add_argument('--save_to_cache', type=bool, default=False)
+    parser.add_argument('--load_from_cache', type=bool, default=False)
+    parser.add_argument('--save_to_cache', type=bool, default=True)
     
     # Distributed
     parser.add_argument('--find_unused_parameters', action='store_true', default=False)
     parser.add_argument('--checkpoint_frequency', type=int, default=5)
-    parser.add_argument('--num_workers', type=int, default=4)
+    parser.add_argument('--num_workers', type=int, default=8)
     
     # AMP (autocast only, no grad scaling)
     parser.add_argument('--disable_amp', action='store_true', default=False,
@@ -298,77 +298,77 @@ def load_and_prepare_data(args, rank, local_rank, world_size, log):
     cache_exists = cache_tensor.item() == 1
     
     # Rank 0 creates cache if needed
-    if rank == 0 and not (args.load_from_cache and cache_exists):
-        log.info("Creating H5 cache...")
-        os.makedirs(args.model_dir, exist_ok=True)
+    #if rank == 0 and not (args.load_from_cache and cache_exists):
+    #    log.info("Creating H5 cache...")
+    #    os.makedirs(args.model_dir, exist_ok=True)
         
         # Load raw data
-        data_path = os.path.join(args.training, args.data_file)
-        log.info(f"  Loading: {data_path}")
-        df = pd.read_json(data_path)
-        log.info(f"  Samples: {len(df)}")
+    #    data_path = os.path.join(args.training, args.data_file)
+    #    log.info(f"  Loading: {data_path}")
+    #    df = pd.read_json(data_path)
+    #    log.info(f"  Samples: {len(df)}")
         
         # Distance matrix
-        distance_path = os.path.join(args.training, args.distance_file)
-        distance_df = pd.read_csv(distance_path) if os.path.exists(distance_path) else None
+    #    distance_path = os.path.join(args.training, args.distance_file)
+    #    distance_df = pd.read_csv(distance_path) if os.path.exists(distance_path) else None
         
         # Split
-        df = df.sample(frac=1, random_state=args.seed).reset_index(drop=True)
-        train_size = int(args.train_ratio * len(df))
-        val_size = int(args.val_ratio * len(df))
+    #    df = df.sample(frac=1, random_state=args.seed).reset_index(drop=True)
+    #    train_size = int(args.train_ratio * len(df))
+    #    val_size = int(args.val_ratio * len(df))
         
-        train_df = df.iloc[:train_size].reset_index(drop=True)
-        val_df = df.iloc[train_size:train_size + val_size].reset_index(drop=True)
-        test_df = df.iloc[train_size + val_size:].reset_index(drop=True)
+    #    train_df = df.iloc[:train_size].reset_index(drop=True)
+    #    val_df = df.iloc[train_size:train_size + val_size].reset_index(drop=True)
+    #    test_df = df.iloc[train_size + val_size:].reset_index(drop=True)
         
-        log.info(f"  Split: Train={len(train_df)}, Val={len(val_df)}, Test={len(test_df)}")
-        del df
-        gc.collect()
+    #    log.info(f"  Split: Train={len(train_df)}, Val={len(val_df)}, Test={len(test_df)}")
+    #    del df
+    #    gc.collect()
         
         # Preprocessor
-        config = Config()
-        preprocessor = PackageLifecyclePreprocessor(config=config, distance_df=distance_df)
-        preprocessor.fit(train_df)
+    #    config = Config()
+    #    preprocessor = PackageLifecyclePreprocessor(config=config, distance_df=distance_df)
+    #    preprocessor.fit(train_df)
         
-        local_preprocessor = os.path.join(args.model_dir, 'preprocessor.pkl')
-        preprocessor.save(local_preprocessor)
-        s3_upload(local_preprocessor, preprocessor_cache, log.info)
+    #    local_preprocessor = os.path.join(args.model_dir, 'preprocessor.pkl')
+    #    preprocessor.save(local_preprocessor)
+    #    s3_upload(local_preprocessor, preprocessor_cache, log.info)
         
-        del distance_df
-        gc.collect()
+    #    del distance_df
+    #    gc.collect()
         
         # Create datasets (saves to S3)
-        log.info("  Creating train.h5...")
-        PackageLifecycleDataset(
-            df=train_df, preprocessor=preprocessor,
-            h5_cache_path=train_cache,
-            load_from_cache=False, save_to_cache=True,
-            log_fn=log.info
-        )
-        del train_df
-        gc.collect()
+    #    log.info("  Creating train.h5...")
+    #    PackageLifecycleDataset(
+    #        df=train_df, preprocessor=preprocessor,
+    #        h5_cache_path=train_cache,
+    #        load_from_cache=False, save_to_cache=True,
+    #        log_fn=log.info
+    #    )
+    #    del train_df
+    #    gc.collect()
         
-        log.info("  Creating val.h5...")
-        PackageLifecycleDataset(
-            df=val_df, preprocessor=preprocessor,
-            h5_cache_path=val_cache,
-            load_from_cache=False, save_to_cache=True,
-            log_fn=log.info
-        )
-        del val_df
-        gc.collect()
+    #    log.info("  Creating val.h5...")
+    #    PackageLifecycleDataset(
+    #        df=val_df, preprocessor=preprocessor,
+    #        h5_cache_path=val_cache,
+    #        load_from_cache=False, save_to_cache=True,
+    #        log_fn=log.info
+    #    )
+    #    del val_df
+    #    gc.collect()
         
-        log.info("  Creating test.h5...")
-        PackageLifecycleDataset(
-            df=test_df, preprocessor=preprocessor,
-            h5_cache_path=test_cache,
-            load_from_cache=False, save_to_cache=True,
-            log_fn=log.info
-        )
-        del test_df
-        gc.collect()
+    #    log.info("  Creating test.h5...")
+    #    PackageLifecycleDataset(
+    #        df=test_df, preprocessor=preprocessor,
+    #        h5_cache_path=test_cache,
+    #        load_from_cache=False, save_to_cache=True,
+    #        log_fn=log.info
+    #    )
+    #    del test_df
+    #    gc.collect()
         
-        log.info("  ✓ Cache created")
+    #    log.info("  ✓ Cache created")
     
     # Wait for rank 0
     sync_barrier(device)
