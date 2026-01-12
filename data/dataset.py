@@ -136,6 +136,7 @@ class PackageLifecycleDataset(Dataset):
     
     Key features:
     - Separates OBSERVABLE and REALIZED node features
+    - Supports Time2Vec format from preprocessor
     - Efficient H5 storage with S3 support
     - Parallel preprocessing with multiprocessing
     
@@ -186,11 +187,17 @@ class PackageLifecycleDataset(Dataset):
         self._collator: Optional['CausalH5BatchCollator'] = None
         self._temp_file: bool = False
         
-        # Feature dimensions
-        self._observable_dim: int = 12
-        self._realized_dim: int = 20
+        # Feature dimensions (defaults, updated from H5)
+        self._observable_dim: int = 9   # 6 time + 3 other
+        self._realized_dim: int = 17    # 6 time + 11 other (with 6 problem types)
         self._edge_dim: int = 8
         self._package_dim: int = 4
+        
+        # Time2Vec dimensions
+        self._obs_time_dim: int = 6
+        self._obs_other_dim: int = 3
+        self._real_time_dim: int = 6
+        self._real_other_dim: int = 11
         
         self._log(f"PackageLifecycleDataset: {h5_cache_path}")
         
@@ -273,6 +280,11 @@ class PackageLifecycleDataset(Dataset):
             'realized_dim': self._realized_dim,
             'edge_dim': self._edge_dim,
             'package_dim': self._package_dim,
+            # Time2Vec specific dims
+            'obs_time_dim': self._obs_time_dim,
+            'obs_other_dim': self._obs_other_dim,
+            'real_time_dim': self._real_time_dim,
+            'real_other_dim': self._real_other_dim,
         }
     
     def _init_from_s3(self, s3_path: str):
@@ -323,16 +335,24 @@ class PackageLifecycleDataset(Dataset):
             self._has_labels = bool(f.attrs.get('has_labels', False))
             
             # Feature dimensions
-            self._observable_dim = int(f.attrs.get('observable_dim', 12))
-            self._realized_dim = int(f.attrs.get('realized_dim', 20))
+            self._observable_dim = int(f.attrs.get('observable_dim', 9))
+            self._realized_dim = int(f.attrs.get('realized_dim', 17))
             self._edge_dim = int(f.attrs.get('edge_dim', 8))
             self._package_dim = int(f.attrs.get('package_dim', 4))
+            
+            # Time2Vec dimensions (if available)
+            self._obs_time_dim = int(f.attrs.get('obs_time_dim', 6))
+            self._obs_other_dim = int(f.attrs.get('obs_other_dim', 3))
+            self._real_time_dim = int(f.attrs.get('real_time_dim', 6))
+            self._real_other_dim = int(f.attrs.get('real_other_dim', self._realized_dim - 6))
             
             self._node_offsets = f['node_offsets'][:]
             self._edge_offsets = f['edge_offsets'][:]
         
         self._log(f"  Loaded {self._num_samples} samples")
-        self._log(f"  Dims: obs={self._observable_dim}, real={self._realized_dim}, edge={self._edge_dim}, pkg={self._package_dim}")
+        self._log(f"  Dims: obs={self._observable_dim} ({self._obs_time_dim}+{self._obs_other_dim}), "
+                  f"real={self._realized_dim} ({self._real_time_dim}+{self._real_other_dim}), "
+                  f"edge={self._edge_dim}, pkg={self._package_dim}")
     
     def _process_dataframe(self, df, preprocessor) -> List[Dict]:
         """Process DataFrame in parallel."""
@@ -374,6 +394,10 @@ class PackageLifecycleDataset(Dataset):
         if n_samples == 0:
             raise ValueError("No samples to write")
         
+        # Debug: print keys from first sample
+        sample0 = cache[0]
+        self._log(f"  Preprocessor output keys: {list(sample0.keys())}")
+        
         # Calculate offsets
         node_offsets = np.zeros(n_samples + 1, dtype=np.int64)
         edge_offsets = np.zeros(n_samples + 1, dtype=np.int64)
@@ -385,15 +409,57 @@ class PackageLifecycleDataset(Dataset):
         total_nodes = int(node_offsets[-1])
         total_edges = int(edge_offsets[-1])
         
-        # Get dimensions from first sample
-        sample0 = cache[0]
+        # Detect preprocessor output format
+        # Format 1: Time2Vec format with separate time/other features
+        if 'node_observable_time' in sample0:
+            obs_time_dim = sample0['node_observable_time'].shape[1]  # 6
+            obs_other_dim = sample0['node_observable_other'].shape[1]  # 3
+            real_time_dim = sample0['node_realized_time'].shape[1]  # 6
+            real_other_dim = sample0['node_realized_other'].shape[1]  # 5 + num_problems
+            
+            observable_dim = obs_time_dim + obs_other_dim
+            realized_dim = real_time_dim + real_other_dim
+            feature_format = 'time2vec'
+            self._log(f"  Using Time2Vec format: obs_time={obs_time_dim}, obs_other={obs_other_dim}, "
+                      f"real_time={real_time_dim}, real_other={real_other_dim}")
         
-        # Preprocessor outputs node_observable_features and node_realized_features
-        observable_dim = sample0['node_observable_features'].shape[1]
-        realized_dim = sample0['node_realized_features'].shape[1]
+        # Format 2: Combined observable/realized features
+        elif 'node_observable_features' in sample0:
+            observable_dim = sample0['node_observable_features'].shape[1]
+            realized_dim = sample0['node_realized_features'].shape[1]
+            obs_time_dim = 6
+            obs_other_dim = observable_dim - 6
+            real_time_dim = 6
+            real_other_dim = realized_dim - 6
+            feature_format = 'combined'
+            self._log(f"  Using combined format: obs={observable_dim}, real={realized_dim}")
+        
+        # Format 3: Single node_features array
+        elif 'node_features' in sample0:
+            total_node_dim = sample0['node_features'].shape[1]
+            observable_dim = min(12, total_node_dim)
+            realized_dim = total_node_dim - observable_dim
+            if realized_dim <= 0:
+                realized_dim = total_node_dim
+            obs_time_dim = 6
+            obs_other_dim = observable_dim - 6
+            real_time_dim = 6
+            real_other_dim = realized_dim - 6
+            feature_format = 'single'
+            self._log(f"  Using single format: splitting {total_node_dim} -> obs={observable_dim}, real={realized_dim}")
+        
+        else:
+            raise KeyError(f"Unrecognized preprocessor output format. Keys: {list(sample0.keys())}")
+        
         edge_dim = sample0['edge_features'].shape[1]
-        package_dim = sample0['package_features'].shape[0]
-        has_labels = 'labels' in sample0
+        
+        # Package features
+        pkg_feat = sample0.get('package_features', sample0.get('graph_features'))
+        if pkg_feat is None:
+            raise KeyError(f"Expected 'package_features' or 'graph_features' in preprocessor output")
+        package_dim = pkg_feat.shape[0] if pkg_feat.ndim == 1 else pkg_feat.shape[1]
+        
+        has_labels = 'labels' in sample0 or 'edge_labels' in sample0
         
         self._log(f"  Writing H5: {total_nodes:,} nodes, {total_edges:,} edges")
         self._log(f"  Dims: obs={observable_dim}, real={realized_dim}, edge={edge_dim}, pkg={package_dim}")
@@ -420,34 +486,62 @@ class PackageLifecycleDataset(Dataset):
             n_s, n_e = int(node_offsets[i]), int(node_offsets[i + 1])
             e_s, e_e = int(edge_offsets[i]), int(edge_offsets[i + 1])
             
-            # Node features
-            node_observable[n_s:n_e] = data['node_observable_features']
-            node_realized[n_s:n_e] = data['node_realized_features']
+            # Node features - handle different formats
+            if feature_format == 'time2vec':
+                # Concatenate time + other features
+                node_observable[n_s:n_e] = np.concatenate([
+                    data['node_observable_time'],
+                    data['node_observable_other']
+                ], axis=1)
+                node_realized[n_s:n_e] = np.concatenate([
+                    data['node_realized_time'],
+                    data['node_realized_other']
+                ], axis=1)
+            elif feature_format == 'combined':
+                node_observable[n_s:n_e] = data['node_observable_features']
+                node_realized[n_s:n_e] = data['node_realized_features']
+            else:  # single format
+                combined = data['node_features']
+                node_observable[n_s:n_e] = combined[:, :observable_dim]
+                node_realized[n_s:n_e] = combined[:, observable_dim:observable_dim + realized_dim]
             
             # Node categorical
+            cat_data = data.get('node_categorical_indices', data.get('node_categorical', {}))
             for f in self._NODE_CAT_FIELDS:
-                node_cat[f][n_s:n_e] = data['node_categorical_indices'][f]
+                if f in cat_data:
+                    node_cat[f][n_s:n_e] = cat_data[f]
+                elif f + '_idx' in data:
+                    node_cat[f][n_s:n_e] = data[f + '_idx']
             
             # Edge features (adjust indices for global indexing)
             edge_index[:, e_s:e_e] = data['edge_index'] + n_s
             edge_features[e_s:e_e] = data['edge_features']
             
             # Package features
-            package_features[i] = data['package_features']
-            source_postal[i] = data['package_categorical']['source_postal']
-            dest_postal[i] = data['package_categorical']['dest_postal']
+            pkg_feat = data.get('package_features', data.get('graph_features'))
+            if pkg_feat.ndim == 1:
+                package_features[i] = pkg_feat
+            else:
+                package_features[i] = pkg_feat.flatten()[:package_dim]
+            
+            # Package categorical
+            pkg_cat = data.get('package_categorical', {})
+            source_postal[i] = pkg_cat.get('source_postal', data.get('source_postal_idx', 0))
+            dest_postal[i] = pkg_cat.get('dest_postal', data.get('dest_postal_idx', 0))
             
             # Labels
             if has_labels:
-                labels_data = data['labels']
-                if labels_data.ndim > 1:
-                    labels_data = labels_data.flatten()
-                edge_labels[e_s:e_e] = labels_data
+                labels_data = data.get('labels', data.get('edge_labels'))
+                if labels_data is not None:
+                    if labels_data.ndim > 1:
+                        labels_data = labels_data.flatten()
+                    edge_labels[e_s:e_e] = labels_data
                 
-                labels_raw_data = data.get('labels_raw', data['labels'])
-                if labels_raw_data.ndim > 1:
-                    labels_raw_data = labels_raw_data.flatten()
-                edge_labels_raw[e_s:e_e] = labels_raw_data
+                labels_raw_data = data.get('labels_raw', data.get('edge_labels_raw', labels_data))
+                if labels_raw_data is not None:
+                    if labels_raw_data.ndim > 1:
+                        labels_raw_data = labels_raw_data.flatten()
+                    edge_labels_raw[e_s:e_e] = labels_raw_data
         
         # Write to H5
         with h5py.File(path, 'w') as f:
@@ -460,6 +554,12 @@ class PackageLifecycleDataset(Dataset):
             f.attrs['realized_dim'] = realized_dim
             f.attrs['edge_dim'] = edge_dim
             f.attrs['package_dim'] = package_dim
+            
+            # Store Time2Vec dimensions
+            f.attrs['obs_time_dim'] = obs_time_dim
+            f.attrs['obs_other_dim'] = obs_other_dim
+            f.attrs['real_time_dim'] = real_time_dim
+            f.attrs['real_other_dim'] = real_other_dim
             
             # Offsets
             f.create_dataset('node_offsets', data=node_offsets)
