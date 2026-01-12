@@ -166,3 +166,6 @@ class Config:
         else:
             with open(path, 'r') as f:
                 return cls.from_dict(json.load(f))
+            
+            
+            

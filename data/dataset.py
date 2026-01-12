@@ -12,6 +12,7 @@ import multiprocessing as mp
 import h5py
 import os
 import tempfile
+import time
 
 
 # =============================================================================
@@ -155,9 +156,24 @@ class PackageLifecycleDataset(Dataset):
         load_from_cache: bool = False,
         save_to_cache: bool = True,
         num_workers: Optional[int] = None,
-        log_fn: Callable = None
+        log_fn: Callable = None,
+        progress_callback: Callable[[int, int], None] = None
     ):
+        """
+        Initialize dataset.
+        
+        Args:
+            df: DataFrame with package data
+            preprocessor: Fitted PackageLifecyclePreprocessor
+            h5_cache_path: Path to H5 cache (local or S3)
+            load_from_cache: If True, load from cache
+            save_to_cache: If True, save processed data to cache
+            num_workers: Number of parallel workers
+            log_fn: Logging function
+            progress_callback: Callback function(processed, total) for progress updates
+        """
         self._log = log_fn or (lambda x: None)
+        self._progress_callback = progress_callback
         self._num_workers = num_workers or max(1, (os.cpu_count() or 1) - 1)
         
         self._s3_path: str = None
@@ -256,6 +272,14 @@ class PackageLifecycleDataset(Dataset):
             'package_dim': self._package_dim,
         }
     
+    def _report_progress(self, processed: int, total: int):
+        """Report progress via callback if available."""
+        if self._progress_callback:
+            try:
+                self._progress_callback(processed, total)
+            except Exception:
+                pass  # Don't let progress callback errors stop processing
+    
     def _init_from_s3(self, s3_path: str):
         self._s3_path = s3_path
         temp_file = tempfile.NamedTemporaryFile(suffix='.h5', delete=False)
@@ -306,38 +330,90 @@ class PackageLifecycleDataset(Dataset):
                   f"real_time={self._real_time_dim}, real_other={self._real_other_dim}")
     
     def _process_dataframe(self, df, preprocessor) -> List[Dict]:
+        """Process DataFrame with progress reporting."""
         preprocessor_bytes = pickle.dumps(preprocessor)
         work_items = [(idx, row.to_dict()) for idx, (_, row) in enumerate(df.iterrows())]
         total = len(work_items)
         
-        self._log(f"  Processing {total} samples with {self._num_workers} workers...")
+        self._log(f"  Processing {total:,} samples with {self._num_workers} workers...")
         
         results_dict = {}
         errors = []
+        processed_count = 0
+        valid_count = 0
+        skipped_count = 0
+        
+        # Progress tracking
+        start_time = time.time()
+        last_log_time = start_time
+        log_interval = 5.0  # Log every 5 seconds
+        progress_interval = max(1, total // 100)  # Update progress every 1%
         
         try:
             ctx = mp.get_context('fork')
         except ValueError:
             ctx = mp.get_context('spawn')
         
+        # Initial progress report
+        self._report_progress(0, total)
+        
         with ctx.Pool(self._num_workers, initializer=_init_worker,
                       initargs=(preprocessor_bytes,), maxtasksperchild=1000) as pool:
-            for i, (idx, features, error) in enumerate(pool.imap_unordered(_process_item, work_items, chunksize=2000)):
+            
+            for idx, features, error in pool.imap_unordered(_process_item, work_items, chunksize=500):
+                processed_count += 1
+                
                 if features is not None:
                     if features['num_nodes'] >= 2:
                         results_dict[idx] = features
-                elif len(errors) < 10:
-                    errors.append((idx, error))
-                if (i + 1) % max(1, total // 5) == 0:
-                    self._log(f"    Processed {i + 1}/{total}")
+                        valid_count += 1
+                    else:
+                        skipped_count += 1
+                else:
+                    skipped_count += 1
+                    if len(errors) < 10:
+                        errors.append((idx, error))
+                
+                # Update progress callback
+                if processed_count % progress_interval == 0 or processed_count == total:
+                    self._report_progress(processed_count, total)
+                
+                # Periodic logging
+                current_time = time.time()
+                if current_time - last_log_time >= log_interval or processed_count == total:
+                    elapsed = current_time - start_time
+                    rate = processed_count / elapsed if elapsed > 0 else 0
+                    pct = 100 * processed_count / total
+                    eta = (total - processed_count) / rate if rate > 0 else 0
+                    
+                    self._log(
+                        f"    Progress: {processed_count:,}/{total:,} ({pct:.1f}%) | "
+                        f"Valid: {valid_count:,} | Skipped: {skipped_count:,} | "
+                        f"Rate: {rate:.0f}/s | ETA: {eta:.0f}s"
+                    )
+                    last_log_time = current_time
+        
+        # Final progress report
+        self._report_progress(total, total)
+        
+        # Final summary
+        elapsed = time.time() - start_time
+        self._log(f"  Processing complete in {elapsed:.1f}s")
+        self._log(f"    Total processed: {processed_count:,}")
+        self._log(f"    Valid samples:   {valid_count:,}")
+        self._log(f"    Skipped:         {skipped_count:,}")
         
         if errors:
-            self._log(f"  Errors ({len(errors)}): {errors[:3]}")
+            self._log(f"  Errors ({len(errors)}):")
+            for err_idx, err_msg in errors[:5]:
+                self._log(f"    [{err_idx}] {err_msg}")
+            if len(errors) > 5:
+                self._log(f"    ... and {len(errors) - 5} more errors")
         
-        self._log(f"  Done: {len(results_dict)} valid samples")
         return [results_dict[i] for i in sorted(results_dict.keys())]
     
     def _write_h5(self, cache: List[Dict], path: str):
+        """Write processed data to H5 file with progress reporting."""
         n_samples = len(cache)
         if n_samples == 0:
             raise ValueError("No samples to write")
@@ -346,12 +422,17 @@ class PackageLifecycleDataset(Dataset):
         self._log(f"  Preprocessor output keys: {list(sample0.keys())}")
         
         # Calculate offsets
+        self._log(f"  Calculating offsets for {n_samples:,} samples...")
         node_offsets = np.zeros(n_samples + 1, dtype=np.int64)
         edge_offsets = np.zeros(n_samples + 1, dtype=np.int64)
         
         for i, data in enumerate(cache):
             node_offsets[i + 1] = node_offsets[i] + data['num_nodes']
             edge_offsets[i + 1] = edge_offsets[i] + data['edge_index'].shape[1]
+            
+            # Progress for offset calculation (quick, so less frequent updates)
+            if (i + 1) % 10000 == 0:
+                self._report_progress(i + 1, n_samples * 2)  # First half of progress
         
         total_nodes = int(node_offsets[-1])
         total_edges = int(edge_offsets[-1])
@@ -378,6 +459,7 @@ class PackageLifecycleDataset(Dataset):
                   f"real_time={real_time_dim}, real_other={real_other_dim}")
         
         # Allocate arrays
+        self._log(f"  Allocating arrays...")
         node_obs_time = np.zeros((total_nodes, obs_time_dim), dtype=np.float32)
         node_obs_other = np.zeros((total_nodes, obs_other_dim), dtype=np.float32)
         node_real_time = np.zeros((total_nodes, real_time_dim), dtype=np.float32)
@@ -396,7 +478,11 @@ class PackageLifecycleDataset(Dataset):
             edge_labels = np.zeros(total_edges, dtype=np.float32)
             edge_labels_raw = np.zeros(total_edges, dtype=np.float32)
         
-        # Fill arrays
+        # Fill arrays with progress
+        self._log(f"  Filling arrays...")
+        start_time = time.time()
+        last_log_time = start_time
+        
         for i, data in enumerate(cache):
             n_s, n_e = int(node_offsets[i]), int(node_offsets[i + 1])
             e_s, e_e = int(edge_offsets[i]), int(edge_offsets[i + 1])
@@ -426,8 +512,19 @@ class PackageLifecycleDataset(Dataset):
                 edge_labels[e_s:e_e] = lbl.flatten() if lbl.ndim > 1 else lbl
                 lbl_raw = data.get('labels_raw', data['labels'])
                 edge_labels_raw[e_s:e_e] = lbl_raw.flatten() if lbl_raw.ndim > 1 else lbl_raw
+            
+            # Progress update (second half)
+            if (i + 1) % 5000 == 0 or i == n_samples - 1:
+                self._report_progress(n_samples + i + 1, n_samples * 2)
+                
+                current_time = time.time()
+                if current_time - last_log_time >= 5.0:
+                    pct = 100 * (i + 1) / n_samples
+                    self._log(f"    Filling arrays: {i + 1:,}/{n_samples:,} ({pct:.1f}%)")
+                    last_log_time = current_time
         
         # Write H5
+        self._log(f"  Writing to disk...")
         with h5py.File(path, 'w') as f:
             f.attrs['num_samples'] = n_samples
             f.attrs['total_nodes'] = total_nodes
@@ -468,7 +565,9 @@ class PackageLifecycleDataset(Dataset):
                 f.create_dataset('edge_labels', data=edge_labels)
                 f.create_dataset('edge_labels_raw', data=edge_labels_raw)
         
-        self._log(f"  ✓ H5 written: {os.path.getsize(path) / 1e6:.1f} MB")
+        elapsed = time.time() - start_time
+        file_size_mb = os.path.getsize(path) / 1e6
+        self._log(f"  ✓ H5 written: {file_size_mb:.1f} MB in {elapsed:.1f}s")
 
 
 # =============================================================================

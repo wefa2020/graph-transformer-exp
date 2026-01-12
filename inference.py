@@ -3,6 +3,9 @@
 inference.py - Neptune-based inference with leg_plan skeleton and iterative rolling predictions
 Uses predicted times (not plan times) to continue the prediction chain
 Includes plan_time for each event
+
+Updated for Time2Vec preprocessor format with separate time/other features.
+Aligned with CausalH5BatchCollator output format.
 """
 
 import torch
@@ -81,19 +84,10 @@ def to_tensor(arr: np.ndarray, dtype: torch.dtype) -> torch.Tensor:
 class EventTimeInference:
     """Inference class with iterative rolling predictions."""
     
+    # Node categorical fields (matches CausalH5BatchCollator)
     _NODE_CAT_FIELDS = [
-        'event_type', 'from_location', 'to_location', 'to_postal',
-        'from_region', 'to_region', 'carrier', 'leg_type', 'ship_method'
-    ]
-    _LOOKAHEAD_CAT_FIELDS = [
-        'next_event_type', 'next_location', 'next_postal', 'next_region',
-        'next_carrier', 'next_leg_type', 'next_ship_method'
-    ]
-    _EDGE_CAT_FIELDS = [
-        'from_location', 'to_location', 'to_postal',
-        'from_region', 'to_region',
-        'carrier_from', 'carrier_to',
-        'ship_method_from', 'ship_method_to'
+        'event_type', 'location', 'postal', 'region',
+        'carrier', 'leg_type', 'ship_method'
     ]
     
     def __init__(
@@ -425,6 +419,7 @@ class EventTimeInference:
                 
                 context = {'has_problem': False}
                 
+                # Problem handling - works with both old (EXIT) and new (INDUCT/LINEHAUL) formats
                 problem = matched_event.get('problem')
                 if problem:
                     context['problem'] = problem
@@ -543,50 +538,59 @@ class EventTimeInference:
         return synthetic
     
     def _features_to_pyg_data(self, features: Dict) -> Data:
-        """Convert preprocessor features dict to PyG Data object."""
+        """
+        Convert preprocessor features dict to PyG Data object.
+        
+        Aligned with CausalH5BatchCollator output format for consistency.
+        """
         node_cat = features['node_categorical_indices']
-        look_cat = features['lookahead_categorical_indices']
-        edge_cat = features['edge_categorical_indices']
         pkg_cat = features['package_categorical']
         
+        # Handle package_features shape - collator outputs [1, package_dim]
+        pkg_feat = features['package_features']
+        if pkg_feat.ndim == 1:
+            pkg_feat = pkg_feat.reshape(1, -1)
+        
         data = Data(
-            node_continuous=to_tensor(features['node_continuous_features'], torch.float32),
+            # Time features (for Time2Vec)
+            node_observable_time=to_tensor(features['node_observable_time'], torch.float32),
+            node_observable_other=to_tensor(features['node_observable_other'], torch.float32),
+            node_realized_time=to_tensor(features['node_realized_time'], torch.float32),
+            node_realized_other=to_tensor(features['node_realized_other'], torch.float32),
+            
+            # Categorical indices
             event_type_idx=to_tensor(node_cat['event_type'], torch.long),
-            from_location_idx=to_tensor(node_cat['from_location'], torch.long),
-            to_location_idx=to_tensor(node_cat['to_location'], torch.long),
-            to_postal_idx=to_tensor(node_cat['to_postal'], torch.long),
-            from_region_idx=to_tensor(node_cat['from_region'], torch.long),
-            to_region_idx=to_tensor(node_cat['to_region'], torch.long),
+            location_idx=to_tensor(node_cat['location'], torch.long),
+            postal_idx=to_tensor(node_cat['postal'], torch.long),
+            region_idx=to_tensor(node_cat['region'], torch.long),
             carrier_idx=to_tensor(node_cat['carrier'], torch.long),
             leg_type_idx=to_tensor(node_cat['leg_type'], torch.long),
             ship_method_idx=to_tensor(node_cat['ship_method'], torch.long),
-            next_event_type_idx=to_tensor(look_cat['next_event_type'], torch.long),
-            next_location_idx=to_tensor(look_cat['next_location'], torch.long),
-            next_postal_idx=to_tensor(look_cat['next_postal'], torch.long),
-            next_region_idx=to_tensor(look_cat['next_region'], torch.long),
-            next_carrier_idx=to_tensor(look_cat['next_carrier'], torch.long),
-            next_leg_type_idx=to_tensor(look_cat['next_leg_type'], torch.long),
-            next_ship_method_idx=to_tensor(look_cat['next_ship_method'], torch.long),
+            
+            # Edge features
+            edge_index=to_tensor(features['edge_index'], torch.long),
+            edge_features=to_tensor(features['edge_features'], torch.float32),
+            
+            # Package features
+            package_features=to_tensor(pkg_feat, torch.float32),
             source_postal_idx=torch.tensor([pkg_cat['source_postal']], dtype=torch.long),
             dest_postal_idx=torch.tensor([pkg_cat['dest_postal']], dtype=torch.long),
-            edge_index=to_tensor(features['edge_index'], torch.long),
-            edge_continuous=to_tensor(features['edge_continuous_features'], torch.float32),
-            edge_from_location_idx=to_tensor(edge_cat['from_location'], torch.long),
-            edge_to_location_idx=to_tensor(edge_cat['to_location'], torch.long),
-            edge_to_postal_idx=to_tensor(edge_cat['to_postal'], torch.long),
-            edge_from_region_idx=to_tensor(edge_cat['from_region'], torch.long),
-            edge_to_region_idx=to_tensor(edge_cat['to_region'], torch.long),
-            edge_carrier_from_idx=to_tensor(edge_cat['carrier_from'], torch.long),
-            edge_carrier_to_idx=to_tensor(edge_cat['carrier_to'], torch.long),
-            edge_ship_method_from_idx=to_tensor(edge_cat['ship_method_from'], torch.long),
-            edge_ship_method_to_idx=to_tensor(edge_cat['ship_method_to'], torch.long),
+            
             num_nodes=features['num_nodes'],
         )
         
+        # Add labels if present - use edge_labels to match collator
         if 'labels' in features:
-            data.labels = to_tensor(features['labels'].flatten(), torch.float32)
-        if 'label_mask' in features:
-            data.label_mask = to_tensor(features['label_mask'].astype(bool), torch.bool)
+            labels = features['labels']
+            if labels.ndim > 1:
+                labels = labels.flatten()
+            data.edge_labels = to_tensor(labels, torch.float32)
+        
+        if 'labels_raw' in features:
+            labels_raw = features['labels_raw']
+            if labels_raw.ndim > 1:
+                labels_raw = labels_raw.flatten()
+            data.edge_labels_raw = to_tensor(labels_raw, torch.float32)
         
         return data
     
@@ -648,22 +652,31 @@ class EventTimeInference:
             if features is None:
                 return None
             
+            # Check minimum events
+            if features['num_nodes'] < 2:
+                return None
+            
             graph_data = self._features_to_pyg_data(features)
             graph_data = graph_data.to(self.device)
+            
+            # Create batch - matches CausalH5BatchCollator output
             batch = Batch.from_data_list([graph_data])
+            batch.node_counts = torch.tensor([graph_data.num_nodes], dtype=torch.long, device=self.device)
+            batch.edge_counts = torch.tensor([graph_data.edge_index.shape[1]], dtype=torch.long, device=self.device)
             
             with torch.amp.autocast('cuda', enabled=self.device.type == 'cuda'):
                 predictions = self.model(batch)
             
-            mask = batch.label_mask
-            masked_preds = predictions[mask].squeeze(-1) if predictions[mask].dim() > 1 else predictions[mask]
-            
-            preds_scaled = masked_preds.float().cpu().numpy()
+            # Get all predictions (one per edge)
+            preds = predictions.squeeze(-1) if predictions.dim() > 1 else predictions
+            preds_scaled = preds.float().cpu().numpy()
             preds_hours = self.preprocessor.inverse_transform_time(preds_scaled).flatten()
             
             return preds_hours
         except Exception as e:
             print(f"    Inference error: {e}")
+            import traceback
+            traceback.print_exc()
             return None
     
     @torch.no_grad()

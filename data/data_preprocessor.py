@@ -26,6 +26,10 @@ class PackageLifecyclePreprocessor:
     Feature Types:
     1. OBSERVABLE features (known BEFORE event happens)
     2. REALIZED features (only known AFTER event happens)
+    
+    Problem Handling:
+    - NEW FORMAT: Problems stored directly on INDUCT/LINEHAUL events
+    - OLD FORMAT: Problems stored on EXIT events (backward compatibility)
     """
     
     def __init__(self, config, distance_df: pd.DataFrame = None, distance_file_path: str = None):
@@ -414,34 +418,63 @@ class PackageLifecyclePreprocessor:
         
         return None
     
-    def _get_exit_problem(self, event: Dict, events: List[Dict], 
-                          event_idx: int) -> Tuple[np.ndarray, float]:
+    def _get_event_problem(self, event: Dict, events: List[Dict], 
+                           event_idx: int) -> Tuple[np.ndarray, float]:
         """
-        For INDUCT/LINEHAUL events, get problem from next EXIT at same sort center.
+        For INDUCT/LINEHAUL events, get problem encoding.
+        
+        Handles both data formats:
+        - NEW FORMAT: Problems are stored directly on INDUCT/LINEHAUL events
+        - OLD FORMAT: Problems are stored on EXIT events (backward compatibility)
+        
+        Logic:
+        1. If event is not INDUCT/LINEHAUL, return no problems
+        2. Check if INDUCT/LINEHAUL has problems directly → use them (new format)
+        3. Otherwise, look for corresponding EXIT and use its problems (old format)
+        
+        Returns:
+            Tuple of (problem_encoding, has_problem_flag)
         """
         event_type = str(event.get('event_type', ''))
         
+        # Only process INDUCT and LINEHAUL events
         if event_type not in ['INDUCT', 'LINEHAUL']:
             return np.zeros(len(self.problem_types), dtype=np.float32), 0.0
         
+        # === STEP 1: Check if this event has problems directly (NEW FORMAT) ===
+        direct_problems = self._parse_problem_field(event.get('problem'))
+        if direct_problems:
+            # Problems found directly on INDUCT/LINEHAUL - use them
+            encoding = self._encode_problems(event.get('problem'))
+            return encoding, 1.0
+        
+        # === STEP 2: Fallback to EXIT problems (OLD FORMAT) ===
         current_sc = self._get_sort_center(event)
         if current_sc == 'UNKNOWN':
             return np.zeros(len(self.problem_types), dtype=np.float32), 0.0
         
+        # Look for next EXIT at same sort center
         for i in range(event_idx + 1, len(events)):
             next_event = events[i]
             next_type = str(next_event.get('event_type', ''))
             next_sc = self._get_sort_center(next_event)
             
             if next_type == 'EXIT' and next_sc == current_sc:
-                problems = self._parse_problem_field(next_event.get('problem'))
-                encoding = self._encode_problems(next_event.get('problem'))
-                has_problem = 1.0 if problems else 0.0
-                return encoding, has_problem
+                # Found corresponding EXIT event
+                exit_problems = self._parse_problem_field(next_event.get('problem'))
+                if exit_problems:
+                    # EXIT has problems - old format
+                    encoding = self._encode_problems(next_event.get('problem'))
+                    return encoding, 1.0
+                else:
+                    # EXIT exists but no problems
+                    return np.zeros(len(self.problem_types), dtype=np.float32), 0.0
             
+            # Stop searching if we've moved to a different sort center
             if next_sc != current_sc and next_sc != 'UNKNOWN':
                 break
         
+        # No problems found in either format
         return np.zeros(len(self.problem_types), dtype=np.float32), 0.0
     
     # =========================================================================
@@ -755,8 +788,8 @@ class PackageLifecyclePreprocessor:
         if event_type in ['INDUCT', 'LINEHAUL']:
             missort = float(event.get('missort', False))
         
-        # Problem encoding
-        problem_encoding, has_problem = self._get_exit_problem(event, events, event_idx)
+        # Problem encoding - handles both new and old data formats
+        problem_encoding, has_problem = self._get_event_problem(event, events, event_idx)
         
         # Other realized features
         other_features = np.concatenate([

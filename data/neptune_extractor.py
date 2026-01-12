@@ -197,7 +197,19 @@ def _extract_package_edges_optimized(gremlin_client, package_id: str) -> Optiona
             if event_time:
                 missorts_by_sc[edge_data['sc']].add(event_time)
         
-        # Process Induct edges
+        # Helper function to get problem info for a sort center and event time
+        def get_problem_info(sort_center: str, event_time) -> Optional[str]:
+            """Get the most recent problem that occurred before or at the event time"""
+            if sort_center in problems_by_sc:
+                relevant_problems = [
+                    p for p in problems_by_sc[sort_center]
+                    if p['event_time'] <= event_time
+                ]
+                if relevant_problems:
+                    return relevant_problems[-1]['container_problems']
+            return None
+        
+        # Process Induct edges - NOW WITH PROBLEM ASSOCIATION
         for edge_data in data.get('induct', []):
             edge = edge_data['edge']
             event_time = edge.get('event_time')
@@ -206,6 +218,9 @@ def _extract_package_edges_optimized(gremlin_client, package_id: str) -> Optiona
             
             sort_center = edge_data['sc']
             has_missort = sort_center in missorts_by_sc and len(missorts_by_sc[sort_center]) > 0
+            
+            # Get problem info for this sort center
+            problem_info = get_problem_info(sort_center, event_time)
             
             package_data['events'].append({
                 'event_type': 'INDUCT',
@@ -217,10 +232,11 @@ def _extract_package_edges_optimized(gremlin_client, package_id: str) -> Optiona
                 'carrier_id': edge.get('carrier_id'),
                 'load_id': edge.get('load_id'),
                 'ship_method': edge.get('ship_method'),
-                'missort': has_missort
+                'missort': has_missort,
+                'problem': problem_info  # ADDED: Problem association
             })
         
-        # Process Exit202 edges
+        # Process Exit202 edges - REMOVED PROBLEM ASSOCIATION
         for edge_data in data.get('exit', []):
             edge = edge_data['edge']
             event_time = edge.get('event_time')
@@ -229,14 +245,7 @@ def _extract_package_edges_optimized(gremlin_client, package_id: str) -> Optiona
             
             sort_center = edge_data['sc']
             
-            problem_info = None
-            if sort_center in problems_by_sc:
-                relevant_problems = [
-                    p for p in problems_by_sc[sort_center]
-                    if p['event_time'] <= event_time
-                ]
-                if relevant_problems:
-                    problem_info = relevant_problems[-1]['container_problems']
+            # REMOVED: Problem info lookup - no longer associated with EXIT
             
             package_data['events'].append({
                 'event_type': 'EXIT',
@@ -244,11 +253,11 @@ def _extract_package_edges_optimized(gremlin_client, package_id: str) -> Optiona
                 'event_time': event_time,
                 'dwelling_seconds': edge.get('dwelling_seconds'),
                 'leg_type': edge.get('leg_type'),
-                'carrier_id': edge.get('carrier_id'),
-                'problem': problem_info
+                'carrier_id': edge.get('carrier_id')
+                # REMOVED: 'problem': problem_info
             })
         
-        # Process LineHaul edges
+        # Process LineHaul edges - NOW WITH PROBLEM ASSOCIATION
         for edge_data in data.get('linehaul', []):
             edge = edge_data['edge']
             event_time = edge.get('event_time')
@@ -257,6 +266,9 @@ def _extract_package_edges_optimized(gremlin_client, package_id: str) -> Optiona
             
             sort_center = edge_data['sc']
             has_missort = sort_center in missorts_by_sc and len(missorts_by_sc[sort_center]) > 0
+            
+            # Get problem info for this sort center
+            problem_info = get_problem_info(sort_center, event_time)
             
             package_data['events'].append({
                 'event_type': 'LINEHAUL',
@@ -267,10 +279,11 @@ def _extract_package_edges_optimized(gremlin_client, package_id: str) -> Optiona
                 'leg_type': edge.get('leg_type'),
                 'carrier_id': edge.get('carrier_id'),
                 'ship_method': edge.get('ship_method'),
-                'missort': has_missort
+                'missort': has_missort,
+                'problem': problem_info  # ADDED: Problem association
             })
         
-        # Process Delivery edge
+        # Process Delivery edge (unchanged)
         for edge_data in data.get('delivery', []):
             edge = edge_data['edge']
             event_time = edge.get('event_time')
@@ -300,7 +313,6 @@ def _extract_package_edges_optimized(gremlin_client, package_id: str) -> Optiona
     except Exception as e:
         print(f"Error extracting edges for package {package_id}: {e}")
         raise
-
 
 def _validate_package_sequence(package_data: Dict) -> Tuple[bool, Optional[str]]:
     """Validate that package has proper event sequence"""
