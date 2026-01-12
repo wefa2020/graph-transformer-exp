@@ -860,9 +860,8 @@ class CausalGraphTransformer(nn.Module):
             combined = torch.cat([source_hidden, edges_hidden], dim=-1)
             preds = self.output_head(combined)
             
-            # 3e. Store at original indices
-            predictions[edge_indices] = preds
-        
+            # 3e. Store at original indices        
+            predictions[edge_indices] = preds.to(predictions.dtype)
         return predictions
     
     def get_num_parameters(self) -> Dict[str, int]:
