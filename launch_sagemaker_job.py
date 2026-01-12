@@ -15,7 +15,7 @@ def launch_distributed_training(
     instance_count=1,
     source_dir='.',
     entry_point='sagemaker_train.py',
-    s3_data_path='s3://graph-transformer-exp/package-lifecycle/cache/test/',
+    s3_data_path='s3://graph-transformer-exp/cache/',
     s3_output_path='s3://graph-transformer-exp/output/',
     role=None,
     max_run_hours=240,

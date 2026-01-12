@@ -48,14 +48,16 @@ class DataConfig:
 class ModelConfig:
     """Model architecture."""
     embed_dim: int = 32
-    hidden_dim: int = 256
+    hidden_dim: int = 512
     num_layers: int = 4
     num_heads: int = 8
     dropout: float = 0.1
     output_dim: int = 1
     use_edge_features: bool = True
-
-
+    time2vec_dim:int = 64
+    edge_time2vec_dim:int = 128
+    
+  
 @dataclass
 class TrainingConfig:
     """Training hyperparameters."""
@@ -80,6 +82,7 @@ class OutputConfig:
     s3_output_dir: str = "s3://graph-transformer-exp/outputs"
     save_checkpoints: bool = True
     save_best_only: bool = False
+    log_every_n_steps: int = 10  # Add this field
 
 
 @dataclass
