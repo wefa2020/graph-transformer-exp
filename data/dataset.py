@@ -134,17 +134,11 @@ class PackageLifecycleDataset(Dataset):
     """
     Dataset for Causal Graph Transformer with S3 H5 cache support.
     
-    Key features:
-    - Separates OBSERVABLE and REALIZED node features
-    - Supports Time2Vec format from preprocessor
-    - Efficient H5 storage with S3 support
-    - Parallel preprocessing with multiprocessing
-    
-    Feature Structure (what model expects):
-    - node_observable: [N, observable_dim] - features known before event
-    - node_realized: [N, realized_dim] - features known after event
-    - edge_features: [E, edge_dim]
-    - package_features: [G, package_dim] - 2D for proper batching!
+    Stores SEPARATE time and other features for Time2Vec model:
+    - node_observable_time: [N, obs_time_dim]
+    - node_observable_other: [N, obs_other_dim]
+    - node_realized_time: [N, real_time_dim]
+    - node_realized_other: [N, real_other_dim]
     """
     
     # Node categorical fields (7 features)
@@ -163,18 +157,6 @@ class PackageLifecycleDataset(Dataset):
         num_workers: Optional[int] = None,
         log_fn: Callable = None
     ):
-        """
-        Initialize dataset.
-        
-        Args:
-            df: DataFrame with 'events' column
-            preprocessor: Fitted PackageLifecyclePreprocessor
-            h5_cache_path: S3 or local path for H5 cache
-            load_from_cache: Whether to load from existing cache
-            save_to_cache: Whether to save processed data to cache
-            num_workers: Number of parallel workers
-            log_fn: Logging function
-        """
         self._log = log_fn or (lambda x: None)
         self._num_workers = num_workers or max(1, (os.cpu_count() or 1) - 1)
         
@@ -187,24 +169,18 @@ class PackageLifecycleDataset(Dataset):
         self._collator: Optional['CausalH5BatchCollator'] = None
         self._temp_file: bool = False
         
-        # Feature dimensions (defaults, updated from H5)
-        self._observable_dim: int = 9   # 6 time + 3 other
-        self._realized_dim: int = 17    # 6 time + 11 other (with 6 problem types)
-        self._edge_dim: int = 8
-        self._package_dim: int = 4
-        
-        # Time2Vec dimensions
+        # Feature dimensions
         self._obs_time_dim: int = 6
         self._obs_other_dim: int = 3
         self._real_time_dim: int = 6
         self._real_other_dim: int = 11
+        self._edge_dim: int = 8
+        self._package_dim: int = 4
         
         self._log(f"PackageLifecycleDataset: {h5_cache_path}")
         
-        # Determine if S3 path
         is_s3 = is_s3_path(h5_cache_path) if h5_cache_path else False
         
-        # Try to load from cache
         if load_from_cache and h5_cache_path:
             if is_s3:
                 if s3_exists(h5_cache_path):
@@ -221,7 +197,6 @@ class PackageLifecycleDataset(Dataset):
             
             self._log(f"  Cache not found, will create new")
         
-        # Process DataFrame
         if df is not None and preprocessor is not None:
             if not preprocessor.fitted:
                 raise ValueError("Preprocessor must be fitted")
@@ -255,13 +230,11 @@ class PackageLifecycleDataset(Dataset):
                 pass
     
     def close(self):
-        """Close resources."""
         if self._collator:
             self._collator.close()
             self._collator = None
     
     def get_collate_fn(self) -> 'CausalH5BatchCollator':
-        """Get collate function for DataLoader."""
         if self._collator:
             self._collator.close()
         self._collator = CausalH5BatchCollator(
@@ -274,88 +247,65 @@ class PackageLifecycleDataset(Dataset):
         return self._collator
     
     def get_feature_dims(self) -> Dict[str, int]:
-        """Get feature dimensions for model initialization."""
         return {
-            'observable_dim': self._observable_dim,
-            'realized_dim': self._realized_dim,
-            'edge_dim': self._edge_dim,
-            'package_dim': self._package_dim,
-            # Time2Vec specific dims
             'obs_time_dim': self._obs_time_dim,
             'obs_other_dim': self._obs_other_dim,
             'real_time_dim': self._real_time_dim,
             'real_other_dim': self._real_other_dim,
+            'edge_dim': self._edge_dim,
+            'package_dim': self._package_dim,
         }
     
     def _init_from_s3(self, s3_path: str):
-        """Download from S3 and initialize."""
         self._s3_path = s3_path
-        
         temp_file = tempfile.NamedTemporaryFile(suffix='.h5', delete=False)
         self._local_path = temp_file.name
         self._temp_file = True
         temp_file.close()
-        
         s3_download(s3_path, self._local_path, self._log)
         self._read_h5_metadata()
     
     def _init_from_local(self, local_path: str):
-        """Initialize from local H5 file."""
         self._local_path = local_path
         self._temp_file = False
         self._read_h5_metadata()
     
     def _init_from_cache(self, cache: List[Dict]):
-        """Initialize from in-memory cache (for small datasets)."""
         temp_file = tempfile.NamedTemporaryFile(suffix='.h5', delete=False)
         self._local_path = temp_file.name
         self._temp_file = True
         temp_file.close()
-        
         self._write_h5(cache, self._local_path)
         self._read_h5_metadata()
     
     def _save_and_upload_to_s3(self, cache: List[Dict], s3_path: str):
-        """Save H5 locally and upload to S3."""
         self._s3_path = s3_path
-        
         temp_file = tempfile.NamedTemporaryFile(suffix='.h5', delete=False)
         self._local_path = temp_file.name
         self._temp_file = True
         temp_file.close()
-        
         self._write_h5(cache, self._local_path)
         s3_upload(self._local_path, s3_path, self._log)
         self._read_h5_metadata()
     
     def _read_h5_metadata(self):
-        """Read metadata from H5 file."""
         with h5py.File(self._local_path, 'r') as f:
             self._num_samples = int(f.attrs['num_samples'])
             self._has_labels = bool(f.attrs.get('has_labels', False))
-            
-            # Feature dimensions
-            self._observable_dim = int(f.attrs.get('observable_dim', 9))
-            self._realized_dim = int(f.attrs.get('realized_dim', 17))
-            self._edge_dim = int(f.attrs.get('edge_dim', 8))
-            self._package_dim = int(f.attrs.get('package_dim', 4))
-            
-            # Time2Vec dimensions (if available)
             self._obs_time_dim = int(f.attrs.get('obs_time_dim', 6))
             self._obs_other_dim = int(f.attrs.get('obs_other_dim', 3))
             self._real_time_dim = int(f.attrs.get('real_time_dim', 6))
-            self._real_other_dim = int(f.attrs.get('real_other_dim', self._realized_dim - 6))
-            
+            self._real_other_dim = int(f.attrs.get('real_other_dim', 11))
+            self._edge_dim = int(f.attrs.get('edge_dim', 8))
+            self._package_dim = int(f.attrs.get('package_dim', 4))
             self._node_offsets = f['node_offsets'][:]
             self._edge_offsets = f['edge_offsets'][:]
         
         self._log(f"  Loaded {self._num_samples} samples")
-        self._log(f"  Dims: obs={self._observable_dim} ({self._obs_time_dim}+{self._obs_other_dim}), "
-                  f"real={self._realized_dim} ({self._real_time_dim}+{self._real_other_dim}), "
-                  f"edge={self._edge_dim}, pkg={self._package_dim}")
+        self._log(f"  Dims: obs_time={self._obs_time_dim}, obs_other={self._obs_other_dim}, "
+                  f"real_time={self._real_time_dim}, real_other={self._real_other_dim}")
     
     def _process_dataframe(self, df, preprocessor) -> List[Dict]:
-        """Process DataFrame in parallel."""
         preprocessor_bytes = pickle.dumps(preprocessor)
         work_items = [(idx, row.to_dict()) for idx, (_, row) in enumerate(df.iterrows())]
         total = len(work_items)
@@ -388,13 +338,10 @@ class PackageLifecycleDataset(Dataset):
         return [results_dict[i] for i in sorted(results_dict.keys())]
     
     def _write_h5(self, cache: List[Dict], path: str):
-        """Write H5 file."""
         n_samples = len(cache)
-        
         if n_samples == 0:
             raise ValueError("No samples to write")
         
-        # Debug: print keys from first sample
         sample0 = cache[0]
         self._log(f"  Preprocessor output keys: {list(sample0.keys())}")
         
@@ -409,64 +356,32 @@ class PackageLifecycleDataset(Dataset):
         total_nodes = int(node_offsets[-1])
         total_edges = int(edge_offsets[-1])
         
-        # Detect preprocessor output format
-        # Format 1: Time2Vec format with separate time/other features
-        if 'node_observable_time' in sample0:
-            obs_time_dim = sample0['node_observable_time'].shape[1]  # 6
-            obs_other_dim = sample0['node_observable_other'].shape[1]  # 3
-            real_time_dim = sample0['node_realized_time'].shape[1]  # 6
-            real_other_dim = sample0['node_realized_other'].shape[1]  # 5 + num_problems
-            
-            observable_dim = obs_time_dim + obs_other_dim
-            realized_dim = real_time_dim + real_other_dim
-            feature_format = 'time2vec'
-            self._log(f"  Using Time2Vec format: obs_time={obs_time_dim}, obs_other={obs_other_dim}, "
-                      f"real_time={real_time_dim}, real_other={real_other_dim}")
+        # Get dimensions - expect Time2Vec format
+        if 'node_observable_time' not in sample0:
+            raise KeyError(f"Expected 'node_observable_time'. Got: {list(sample0.keys())}")
         
-        # Format 2: Combined observable/realized features
-        elif 'node_observable_features' in sample0:
-            observable_dim = sample0['node_observable_features'].shape[1]
-            realized_dim = sample0['node_realized_features'].shape[1]
-            obs_time_dim = 6
-            obs_other_dim = observable_dim - 6
-            real_time_dim = 6
-            real_other_dim = realized_dim - 6
-            feature_format = 'combined'
-            self._log(f"  Using combined format: obs={observable_dim}, real={realized_dim}")
-        
-        # Format 3: Single node_features array
-        elif 'node_features' in sample0:
-            total_node_dim = sample0['node_features'].shape[1]
-            observable_dim = min(12, total_node_dim)
-            realized_dim = total_node_dim - observable_dim
-            if realized_dim <= 0:
-                realized_dim = total_node_dim
-            obs_time_dim = 6
-            obs_other_dim = observable_dim - 6
-            real_time_dim = 6
-            real_other_dim = realized_dim - 6
-            feature_format = 'single'
-            self._log(f"  Using single format: splitting {total_node_dim} -> obs={observable_dim}, real={realized_dim}")
-        
-        else:
-            raise KeyError(f"Unrecognized preprocessor output format. Keys: {list(sample0.keys())}")
-        
+        obs_time_dim = sample0['node_observable_time'].shape[1]
+        obs_other_dim = sample0['node_observable_other'].shape[1]
+        real_time_dim = sample0['node_realized_time'].shape[1]
+        real_other_dim = sample0['node_realized_other'].shape[1]
         edge_dim = sample0['edge_features'].shape[1]
         
-        # Package features
-        pkg_feat = sample0.get('package_features', sample0.get('graph_features'))
+        pkg_feat = sample0.get('package_features')
         if pkg_feat is None:
-            raise KeyError(f"Expected 'package_features' or 'graph_features' in preprocessor output")
+            raise KeyError("Expected 'package_features'")
         package_dim = pkg_feat.shape[0] if pkg_feat.ndim == 1 else pkg_feat.shape[1]
         
-        has_labels = 'labels' in sample0 or 'edge_labels' in sample0
+        has_labels = 'labels' in sample0
         
         self._log(f"  Writing H5: {total_nodes:,} nodes, {total_edges:,} edges")
-        self._log(f"  Dims: obs={observable_dim}, real={realized_dim}, edge={edge_dim}, pkg={package_dim}")
+        self._log(f"  Dims: obs_time={obs_time_dim}, obs_other={obs_other_dim}, "
+                  f"real_time={real_time_dim}, real_other={real_other_dim}")
         
         # Allocate arrays
-        node_observable = np.zeros((total_nodes, observable_dim), dtype=np.float32)
-        node_realized = np.zeros((total_nodes, realized_dim), dtype=np.float32)
+        node_obs_time = np.zeros((total_nodes, obs_time_dim), dtype=np.float32)
+        node_obs_other = np.zeros((total_nodes, obs_other_dim), dtype=np.float32)
+        node_real_time = np.zeros((total_nodes, real_time_dim), dtype=np.float32)
+        node_real_other = np.zeros((total_nodes, real_other_dim), dtype=np.float32)
         
         node_cat = {f: np.zeros(total_nodes, dtype=np.int32) for f in self._NODE_CAT_FIELDS}
         
@@ -486,107 +401,69 @@ class PackageLifecycleDataset(Dataset):
             n_s, n_e = int(node_offsets[i]), int(node_offsets[i + 1])
             e_s, e_e = int(edge_offsets[i]), int(edge_offsets[i + 1])
             
-            # Node features - handle different formats
-            if feature_format == 'time2vec':
-                # Concatenate time + other features
-                node_observable[n_s:n_e] = np.concatenate([
-                    data['node_observable_time'],
-                    data['node_observable_other']
-                ], axis=1)
-                node_realized[n_s:n_e] = np.concatenate([
-                    data['node_realized_time'],
-                    data['node_realized_other']
-                ], axis=1)
-            elif feature_format == 'combined':
-                node_observable[n_s:n_e] = data['node_observable_features']
-                node_realized[n_s:n_e] = data['node_realized_features']
-            else:  # single format
-                combined = data['node_features']
-                node_observable[n_s:n_e] = combined[:, :observable_dim]
-                node_realized[n_s:n_e] = combined[:, observable_dim:observable_dim + realized_dim]
+            node_obs_time[n_s:n_e] = data['node_observable_time']
+            node_obs_other[n_s:n_e] = data['node_observable_other']
+            node_real_time[n_s:n_e] = data['node_realized_time']
+            node_real_other[n_s:n_e] = data['node_realized_other']
             
-            # Node categorical
-            cat_data = data.get('node_categorical_indices', data.get('node_categorical', {}))
+            cat_data = data.get('node_categorical_indices', {})
             for f in self._NODE_CAT_FIELDS:
                 if f in cat_data:
                     node_cat[f][n_s:n_e] = cat_data[f]
-                elif f + '_idx' in data:
-                    node_cat[f][n_s:n_e] = data[f + '_idx']
             
-            # Edge features (adjust indices for global indexing)
             edge_index[:, e_s:e_e] = data['edge_index'] + n_s
             edge_features[e_s:e_e] = data['edge_features']
             
-            # Package features
-            pkg_feat = data.get('package_features', data.get('graph_features'))
-            if pkg_feat.ndim == 1:
-                package_features[i] = pkg_feat
-            else:
-                package_features[i] = pkg_feat.flatten()[:package_dim]
+            pkg = data['package_features']
+            package_features[i] = pkg if pkg.ndim == 1 else pkg.flatten()[:package_dim]
             
-            # Package categorical
             pkg_cat = data.get('package_categorical', {})
-            source_postal[i] = pkg_cat.get('source_postal', data.get('source_postal_idx', 0))
-            dest_postal[i] = pkg_cat.get('dest_postal', data.get('dest_postal_idx', 0))
+            source_postal[i] = pkg_cat.get('source_postal', 0)
+            dest_postal[i] = pkg_cat.get('dest_postal', 0)
             
-            # Labels
             if has_labels:
-                labels_data = data.get('labels', data.get('edge_labels'))
-                if labels_data is not None:
-                    if labels_data.ndim > 1:
-                        labels_data = labels_data.flatten()
-                    edge_labels[e_s:e_e] = labels_data
-                
-                labels_raw_data = data.get('labels_raw', data.get('edge_labels_raw', labels_data))
-                if labels_raw_data is not None:
-                    if labels_raw_data.ndim > 1:
-                        labels_raw_data = labels_raw_data.flatten()
-                    edge_labels_raw[e_s:e_e] = labels_raw_data
+                lbl = data['labels']
+                edge_labels[e_s:e_e] = lbl.flatten() if lbl.ndim > 1 else lbl
+                lbl_raw = data.get('labels_raw', data['labels'])
+                edge_labels_raw[e_s:e_e] = lbl_raw.flatten() if lbl_raw.ndim > 1 else lbl_raw
         
-        # Write to H5
+        # Write H5
         with h5py.File(path, 'w') as f:
-            # Metadata
             f.attrs['num_samples'] = n_samples
             f.attrs['total_nodes'] = total_nodes
             f.attrs['total_edges'] = total_edges
             f.attrs['has_labels'] = has_labels
-            f.attrs['observable_dim'] = observable_dim
-            f.attrs['realized_dim'] = realized_dim
-            f.attrs['edge_dim'] = edge_dim
-            f.attrs['package_dim'] = package_dim
-            
-            # Store Time2Vec dimensions
             f.attrs['obs_time_dim'] = obs_time_dim
             f.attrs['obs_other_dim'] = obs_other_dim
             f.attrs['real_time_dim'] = real_time_dim
             f.attrs['real_other_dim'] = real_other_dim
+            f.attrs['edge_dim'] = edge_dim
+            f.attrs['package_dim'] = package_dim
             
-            # Offsets
             f.create_dataset('node_offsets', data=node_offsets)
             f.create_dataset('edge_offsets', data=edge_offsets)
             
-            # Node features
-            f.create_dataset('node_observable', data=node_observable,
-                           chunks=(min(10000, max(1, total_nodes)), observable_dim))
-            f.create_dataset('node_realized', data=node_realized,
-                           chunks=(min(10000, max(1, total_nodes)), realized_dim))
+            f.create_dataset('node_observable_time', data=node_obs_time,
+                           chunks=(min(10000, max(1, total_nodes)), obs_time_dim))
+            f.create_dataset('node_observable_other', data=node_obs_other,
+                           chunks=(min(10000, max(1, total_nodes)), obs_other_dim))
+            f.create_dataset('node_realized_time', data=node_real_time,
+                           chunks=(min(10000, max(1, total_nodes)), real_time_dim))
+            f.create_dataset('node_realized_other', data=node_real_other,
+                           chunks=(min(10000, max(1, total_nodes)), real_other_dim))
             
-            # Node categorical
             grp = f.create_group('node_categorical')
             for k, v in node_cat.items():
                 grp.create_dataset(k, data=v)
             
-            # Edge features
             f.create_dataset('edge_index', data=edge_index)
             f.create_dataset('edge_features', data=edge_features,
                            chunks=(min(10000, max(1, total_edges)), edge_dim))
             
-            # Package features
             f.create_dataset('package_features', data=package_features)
             f.create_dataset('source_postal', data=source_postal)
             f.create_dataset('dest_postal', data=dest_postal)
             
-            # Labels
             if has_labels:
                 f.create_dataset('edge_labels', data=edge_labels)
                 f.create_dataset('edge_labels_raw', data=edge_labels_raw)
@@ -599,17 +476,7 @@ class PackageLifecycleDataset(Dataset):
 # =============================================================================
 
 class CausalH5BatchCollator:
-    """
-    Collate function that reads batch from H5 file.
-    
-    Produces batches with:
-    - node_observable: [total_nodes, observable_dim]
-    - node_realized: [total_nodes, realized_dim]
-    - edge_features: [total_edges, edge_dim]
-    - package_features: [num_graphs, package_dim] - 2D!
-    - All categorical indices
-    - edge_labels (if available)
-    """
+    """Collate function that reads batch from H5 file with separate time/other features."""
     
     def __init__(
         self,
@@ -628,7 +495,6 @@ class CausalH5BatchCollator:
         self._pid: Optional[int] = None
     
     def _get_h5(self) -> h5py.File:
-        """Get H5 file handle (reopens if process forked)."""
         pid = os.getpid()
         if self._h5_file is None or self._pid != pid:
             self.close()
@@ -637,7 +503,6 @@ class CausalH5BatchCollator:
         return self._h5_file
     
     def close(self):
-        """Close H5 file."""
         if self._h5_file:
             try:
                 self._h5_file.close()
@@ -649,17 +514,6 @@ class CausalH5BatchCollator:
         self.close()
     
     def __call__(self, indices: List[int]) -> Optional[Batch]:
-        """
-        Collate batch of samples.
-        
-        Returns PyG Batch with:
-        - node_observable: [total_nodes, observable_dim]
-        - node_realized: [total_nodes, realized_dim]
-        - edge_features: [total_edges, edge_dim]
-        - package_features: [num_graphs, package_dim] - 2D for proper batching!
-        - All categorical indices
-        - edge_labels (if available)
-        """
         if not indices:
             return None
         
@@ -672,31 +526,27 @@ class CausalH5BatchCollator:
             num_nodes = n_end - n_start
             num_edges = e_end - e_start
             
-            # Skip samples with no edges
             if num_edges == 0:
                 continue
             
-            # Read node features
-            node_obs = f['node_observable'][n_start:n_end]
-            node_real = f['node_realized'][n_start:n_end]
+            # Read separate time/other features
+            node_obs_time = f['node_observable_time'][n_start:n_end]
+            node_obs_other = f['node_observable_other'][n_start:n_end]
+            node_real_time = f['node_realized_time'][n_start:n_end]
+            node_real_other = f['node_realized_other'][n_start:n_end]
             
-            # Read node categorical
             node_cat = {k: f['node_categorical'][k][n_start:n_end] for k in self.node_cat_fields}
             
-            # Read edge features (adjust indices to local)
             edge_idx = f['edge_index'][:, e_start:e_end] - n_start
             edge_feat = f['edge_features'][e_start:e_end]
+            pkg_feat = f['package_features'][idx:idx+1]
             
-            # Read package features - KEEP AS 2D [1, package_dim]!
-            pkg_feat = f['package_features'][idx:idx+1]  # [1, package_dim]
-            
-            # Build Data object
             data = Data(
-                # Node features (names match what model expects)
-                node_observable=to_tensor(node_obs, torch.float32),
-                node_realized=to_tensor(node_real, torch.float32),
+                node_observable_time=to_tensor(node_obs_time, torch.float32),
+                node_observable_other=to_tensor(node_obs_other, torch.float32),
+                node_realized_time=to_tensor(node_real_time, torch.float32),
+                node_realized_other=to_tensor(node_real_other, torch.float32),
                 
-                # Node categorical
                 event_type_idx=to_tensor(node_cat['event_type'], torch.long),
                 location_idx=to_tensor(node_cat['location'], torch.long),
                 postal_idx=to_tensor(node_cat['postal'], torch.long),
@@ -705,22 +555,16 @@ class CausalH5BatchCollator:
                 leg_type_idx=to_tensor(node_cat['leg_type'], torch.long),
                 ship_method_idx=to_tensor(node_cat['ship_method'], torch.long),
                 
-                # Edge features
                 edge_index=to_tensor(edge_idx, torch.long),
                 edge_features=to_tensor(edge_feat, torch.float32),
                 
-                # Package features - 2D [1, package_dim]
                 package_features=to_tensor(pkg_feat, torch.float32),
-                
-                # Package postal - keep as [1] tensors for proper stacking
                 source_postal_idx=torch.tensor([int(f['source_postal'][idx])], dtype=torch.long),
                 dest_postal_idx=torch.tensor([int(f['dest_postal'][idx])], dtype=torch.long),
                 
-                # Metadata
                 num_nodes=num_nodes,
             )
             
-            # Labels
             if self.has_labels:
                 data.edge_labels = to_tensor(f['edge_labels'][e_start:e_end], torch.float32)
                 data.edge_labels_raw = to_tensor(f['edge_labels_raw'][e_start:e_end], torch.float32)
@@ -730,10 +574,7 @@ class CausalH5BatchCollator:
         if not data_list:
             return None
         
-        # Batch using PyG
         batch = Batch.from_data_list(data_list)
-        
-        # Store counts for indexing
         batch.node_counts = torch.tensor([d.num_nodes for d in data_list], dtype=torch.long)
         batch.edge_counts = torch.tensor([d.edge_index.shape[1] for d in data_list], dtype=torch.long)
         
