@@ -1,9 +1,18 @@
-# config.py
-
 import os
 import json
 from dataclasses import dataclass, field, asdict
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
+from pathlib import Path
+
+def _load_config_json() -> Dict[str, Any]:
+    """Load config.json from the same directory as this module."""
+    config_path = Path(__file__).parent / "config.json"
+    if config_path.exists():
+        with open(config_path, 'r') as f:
+            return json.load(f)
+    return {}
+
+_CONFIG_JSON = _load_config_json()
 
 
 @dataclass
@@ -13,6 +22,10 @@ class DataConfig:
     source_data: str = "s3://graph-transformer-exp/data/test.json"
     distance_file: Optional[str] = None
     num_workers: int = 8
+    
+    event_types: List[str] = field(default_factory=lambda: _CONFIG_JSON.get('event_types', []))
+    problem_types: List[str] = field(default_factory=lambda: _CONFIG_JSON.get('problem_types', []))
+    zip_codes: List[str] = field(default_factory=lambda: _CONFIG_JSON.get('zip_codes', []))
     
     @property
     def train_h5(self) -> str:
@@ -97,6 +110,9 @@ class Config:
                 'source_data': self.data.source_data,
                 'distance_file': self.data.distance_file,
                 'num_workers': self.data.num_workers,
+                'event_types': self.data.event_types,
+                'problem_types': self.data.problem_types,
+                'zip_codes': self.data.zip_codes,
             },
             'model': asdict(self.model),
             'training': asdict(self.training),
@@ -114,6 +130,9 @@ class Config:
                 source_data=data_dict.get('source_data', ''),
                 distance_file=data_dict.get('distance_file'),
                 num_workers=data_dict.get('num_workers', 8),
+                event_types=data_dict.get('event_types', _CONFIG_JSON.get('event_types', [])),
+                problem_types=data_dict.get('problem_types', _CONFIG_JSON.get('problem_types', [])),
+                zip_codes=data_dict.get('zip_codes', _CONFIG_JSON.get('zip_codes', [])),
             ),
             model=ModelConfig(**d.get('model', {})),
             training=TrainingConfig(**d.get('training', {})),

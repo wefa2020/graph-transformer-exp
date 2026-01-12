@@ -1,5 +1,5 @@
 """
-data/preprocessing.py - Causal Package Lifecycle Preprocessor
+data/data_preprocessor.py - Causal Package Lifecycle Preprocessor with Time2Vec Support
 """
 
 import numpy as np
@@ -7,44 +7,31 @@ import pandas as pd
 from datetime import datetime
 from typing import Dict, List, Union, Optional, Tuple
 from sklearn.preprocessing import LabelEncoder, StandardScaler
+from collections import defaultdict
 import json
 import ast
 import os
+import io
 import pickle
 
 
 class PackageLifecyclePreprocessor:
     """
-    Causal preprocessor for package lifecycle data.
+    Causal preprocessor for package lifecycle data with Time2Vec support.
     
-    CRITICAL: Prevents data leakage by separating features into:
+    Time Features Output:
+    - Raw time values for Time2Vec (hour, dow, dom, month, elapsed, time_delta)
+    - These are processed by the model's Time2Vec layers
     
-    1. OBSERVABLE features (known BEFORE event happens):
-       - event_type, location, carrier, ship_method, leg_type
-       - plan_time (when we expect it to happen)
-       - distance, region info (static/known)
-       
-    2. REALIZED features (only known AFTER event happens):
-       - actual event_time
-       - time_since_prev (computed from actual times)
-       - dwelling_time
-       - time_vs_plan (how late/early vs plan)
-       - problems (discovered during processing)
-    
-    For causal prediction of edge i→i+1:
-    - Nodes 0..i: Use OBSERVABLE + REALIZED features
-    - Node i+1 (target): Use OBSERVABLE features only
-    - Nodes i+2..N: Use OBSERVABLE features only (or masked)
-    
-    Plan Time Logic:
-    - EXIT events: plan_time = previous event's CPT (INDUCT/LINEHAUL)
-    - Other events: use their own plan_time
+    Feature Types:
+    1. OBSERVABLE features (known BEFORE event happens)
+    2. REALIZED features (only known AFTER event happens)
     """
     
     def __init__(self, config, distance_df: pd.DataFrame = None, distance_file_path: str = None):
         """
         Args:
-            config: Configuration object with data.event_types and data.problem_types
+            config: Configuration object with data.event_types, data.problem_types, and data.zip_codes
             distance_df: Pre-loaded DataFrame with distance data
             distance_file_path: Path to location_distances_complete.csv
         """
@@ -67,28 +54,106 @@ class PackageLifecyclePreprocessor:
         self.postal_encoder = LabelEncoder()
         self.region_encoder = LabelEncoder()
         
-        # === Scalers for REALIZED features ===
+        # === Scalers for continuous features ===
         self.time_since_prev_scaler = StandardScaler()
         self.dwelling_time_scaler = StandardScaler()
-        self.time_vs_plan_scaler = StandardScaler()
-        
-        # === Scalers for OBSERVABLE features ===
-        self.time_until_plan_scaler = StandardScaler()
+        self.time_delta_scaler = StandardScaler()  # For time_until_plan and time_vs_plan
+        self.elapsed_time_scaler = StandardScaler()
         self.edge_distance_scaler = StandardScaler()
-        
-        # === Label scaler ===
         self.label_time_scaler = StandardScaler()
-        
-        # === Package Feature Scaler ===
         self.package_feature_scaler = StandardScaler()
         
         # Event and problem types from config
         self.event_types = config.data.event_types
         self.problem_types = config.data.problem_types
+        self.zip_codes = self._get_zip_codes_from_config(config)
         self.problem_type_to_idx = {}
         
         self.fitted = False
         self.vocab_sizes = {}
+        
+        # === Unknown value tracking ===
+        self.track_unknowns = False
+        self.unknown_values = defaultdict(set)
+        self.unknown_counts = defaultdict(int)
+        
+        # === Feature dimensions (updated for Time2Vec) ===
+        # Observable: [time_features(6), is_delivery(1), position(1), has_plan(1)] = 9
+        # Realized: [time_features(6), time_since_prev(1), dwelling(2), missort(1), problem(1+N)] = 11 + N
+        self.observable_time_dim = 6  # hour, dow, dom, month, elapsed, time_until_plan
+        self.realized_time_dim = 6    # hour, dow, dom, month, elapsed, time_vs_plan
+    
+    def enable_unknown_tracking(self, enable: bool = True):
+        """Enable/disable tracking of unknown values."""
+        self.track_unknowns = enable
+        if enable:
+            self.unknown_values = defaultdict(set)
+            self.unknown_counts = defaultdict(int)
+    
+    def get_unknown_summary(self) -> Dict:
+        """Get summary of all unknown values encountered."""
+        return {
+            'counts': dict(self.unknown_counts),
+            'values': {k: list(v) for k, v in self.unknown_values.items()}
+        }
+    
+    def print_unknown_summary(self):
+        """Print a formatted summary of unknown values."""
+        print("\n" + "=" * 70)
+        print("UNKNOWN VALUES SUMMARY")
+        print("=" * 70)
+        
+        if not self.unknown_counts:
+            print("  No unknown values encountered.")
+            return
+        
+        total_unknowns = sum(self.unknown_counts.values())
+        print(f"\nTotal unknown encodings: {total_unknowns:,}")
+        print("-" * 70)
+        
+        for category in sorted(self.unknown_counts.keys()):
+            count = self.unknown_counts[category]
+            values = self.unknown_values[category]
+            
+            print(f"\n{category}:")
+            print(f"  Count: {count:,}")
+            print(f"  Unique values ({len(values)}):")
+            
+            sorted_values = sorted(values, key=lambda x: str(x))
+            if len(sorted_values) <= 20:
+                for val in sorted_values:
+                    print(f"    - '{val}'")
+            else:
+                for val in sorted_values[:10]:
+                    print(f"    - '{val}'")
+                print(f"    ... and {len(sorted_values) - 10} more")
+        
+        print("\n" + "=" * 70)
+    
+    def _get_zip_codes_from_config(self, config) -> List[str]:
+        """Extract zip_codes from config with multiple fallback options."""
+        zip_codes = []
+        
+        if hasattr(config, 'data'):
+            if hasattr(config.data, 'zip_codes'):
+                zip_codes = config.data.zip_codes
+            elif isinstance(config.data, dict) and 'zip_codes' in config.data:
+                zip_codes = config.data['zip_codes']
+        elif hasattr(config, 'zip_codes'):
+            zip_codes = config.zip_codes
+        elif isinstance(config, dict):
+            if 'data' in config and 'zip_codes' in config['data']:
+                zip_codes = config['data']['zip_codes']
+            elif 'zip_codes' in config:
+                zip_codes = config['zip_codes']
+        
+        if zip_codes:
+            zip_codes = [str(z) for z in zip_codes]
+            print(f"Loaded {len(zip_codes)} zip codes from config")
+        else:
+            print("Warning: No zip_codes found in config, will collect from data during fit()")
+        
+        return zip_codes
     
     # =========================================================================
     # DISTANCE DATA LOADING
@@ -130,7 +195,6 @@ class PackageLifecyclePreprocessor:
                 print(f"Warning: Expected columns {required_cols} not found")
                 return
             
-            # Determine distance column
             if 'distance_miles' in df_dist.columns:
                 dist_col = 'distance_miles'
                 self.distance_unit = 'miles'
@@ -141,7 +205,6 @@ class PackageLifecyclePreprocessor:
                 print("Warning: No distance column found")
                 return
             
-            # Build lookups
             for _, row in df_dist.iterrows():
                 loc1 = str(row['location_id_1']).strip()
                 loc2 = str(row['location_id_2']).strip()
@@ -154,11 +217,9 @@ class PackageLifecyclePreprocessor:
                 if pd.isna(distance) or distance < 0:
                     continue
                 
-                # Bidirectional
                 self.distance_lookup[(loc1, loc2)] = distance
                 self.distance_lookup[(loc2, loc1)] = distance
                 
-                # Region info
                 if 'super_region_1' in df_dist.columns:
                     region1 = row.get('super_region_1')
                     if pd.notna(region1) and str(region1).strip():
@@ -286,33 +347,51 @@ class PackageLifecyclePreprocessor:
             for problem in problems:
                 if problem in self.problem_type_to_idx:
                     encoding[self.problem_type_to_idx[problem]] = 1.0
+                elif self.track_unknowns:
+                    self.unknown_values['problem_type'].add(problem)
+                    self.unknown_counts['problem_type'] += 1
         
         return encoding
     
-    def _safe_encode(self, encoder: LabelEncoder, value, default: str = 'UNKNOWN') -> int:
+    def _safe_encode(self, encoder: LabelEncoder, value, category: str, 
+                     default: str = 'UNKNOWN') -> int:
         """Safely encode a value, returning UNKNOWN index if not found."""
+        original_value = value
+        
         if value is None or value == '' or str(value) == 'nan':
             value = default
         else:
             value = str(value)
         
         if value not in encoder.classes_:
+            if self.track_unknowns and value != default:
+                self.unknown_values[category].add(original_value)
+                self.unknown_counts[category] += 1
             value = default
         
         return int(encoder.transform([value])[0])
     
-    def _extract_cyclical_time(self, dt: datetime, prefix: str = '') -> Dict[str, float]:
-        """Extract cyclical time features from datetime."""
-        return {
-            f'{prefix}hour_sin': np.sin(2 * np.pi * dt.hour / 24),
-            f'{prefix}hour_cos': np.cos(2 * np.pi * dt.hour / 24),
-            f'{prefix}dow_sin': np.sin(2 * np.pi * dt.weekday() / 7),
-            f'{prefix}dow_cos': np.cos(2 * np.pi * dt.weekday() / 7),
-            f'{prefix}dom_sin': np.sin(2 * np.pi * dt.day / 31),
-            f'{prefix}dom_cos': np.cos(2 * np.pi * dt.day / 31),
-            f'{prefix}month_sin': np.sin(2 * np.pi * dt.month / 12),
-            f'{prefix}month_cos': np.cos(2 * np.pi * dt.month / 12),
-        }
+    def _extract_raw_time_features(self, dt: datetime, elapsed_hours: float, 
+                                    time_delta: float) -> np.ndarray:
+        """
+        Extract raw time features for Time2Vec.
+        
+        Args:
+            dt: The datetime to extract features from
+            elapsed_hours: Hours since journey start
+            time_delta: Time difference (until_plan or vs_plan) in hours
+        
+        Returns:
+            Array of [hour, dow, dom, month, elapsed, time_delta]
+        """
+        return np.array([
+            dt.hour + dt.minute / 60.0,  # Hour as float (0-24)
+            dt.weekday(),                 # Day of week (0-6)
+            dt.day,                       # Day of month (1-31)
+            dt.month,                     # Month (1-12)
+            elapsed_hours,                # Hours since first event
+            time_delta,                   # Time delta (scaled separately)
+        ], dtype=np.float32)
     
     def _get_plan_time_for_event(self, event: Dict, prev_event: Dict = None) -> Optional[str]:
         """
@@ -376,22 +455,31 @@ class PackageLifecyclePreprocessor:
         all_carriers = set()
         all_leg_types = set()
         all_ship_methods = set()
-        all_postals = set()
         all_regions = set()
+        all_postals = set()
         
-        # Add regions from distance file
+        if self.zip_codes:
+            all_postals.update(self.zip_codes)
+            print(f"Using {len(self.zip_codes)} postal codes from config.data.zip_codes")
+        else:
+            print("Collecting postal codes from data (no zip_codes in config)")
+            for _, row in df.iterrows():
+                source_postal = row.get('source_postal')
+                dest_postal = row.get('dest_postal')
+                if source_postal and str(source_postal) != 'nan':
+                    all_postals.add(str(source_postal))
+                if dest_postal and str(dest_postal) != 'nan':
+                    all_postals.add(str(dest_postal))
+                
+                events = row['events']
+                for event in events:
+                    postal = self._get_delivery_postal(event)
+                    if postal != 'UNKNOWN':
+                        all_postals.add(postal)
+        
         all_regions.update(self.region_lookup.values())
         
-        # Collect categorical values
         for _, row in df.iterrows():
-            # Package level postal codes
-            source_postal = row.get('source_postal')
-            dest_postal = row.get('dest_postal')
-            if source_postal and str(source_postal) != 'nan':
-                all_postals.add(str(source_postal))
-            if dest_postal and str(dest_postal) != 'nan':
-                all_postals.add(str(dest_postal))
-            
             events = row['events']
             for event in events:
                 loc = self._get_location(event)
@@ -400,10 +488,6 @@ class PackageLifecyclePreprocessor:
                     region = self._get_region(loc)
                     if region != 'UNKNOWN':
                         all_regions.add(region)
-                
-                postal = self._get_delivery_postal(event)
-                if postal != 'UNKNOWN':
-                    all_postals.add(postal)
                 
                 if event.get('carrier_id'):
                     all_carriers.add(str(event['carrier_id']))
@@ -414,7 +498,7 @@ class PackageLifecyclePreprocessor:
         
         # Fit encoders with special tokens (PAD=0, UNKNOWN=1)
         special = ['PAD', 'UNKNOWN']
-        self.event_type_encoder.fit(['PAD'] + self.event_types)
+        self.event_type_encoder.fit(special + self.event_types)
         self.location_encoder.fit(special + sorted(list(all_locations - {'UNKNOWN'})))
         self.carrier_encoder.fit(special + sorted(list(all_carriers - {'UNKNOWN'})))
         self.leg_type_encoder.fit(special + sorted(list(all_leg_types - {'UNKNOWN'})))
@@ -422,7 +506,6 @@ class PackageLifecyclePreprocessor:
         self.postal_encoder.fit(special + sorted(list(all_postals - {'UNKNOWN'})))
         self.region_encoder.fit(special + sorted(list(all_regions - {'UNKNOWN'})))
         
-        # Store vocabulary sizes
         self.vocab_sizes = {
             'event_type': len(self.event_type_encoder.classes_),
             'location': len(self.location_encoder.classes_),
@@ -443,41 +526,49 @@ class PackageLifecyclePreprocessor:
         # Collect values for scalers
         time_since_prev_vals = []
         dwelling_vals = []
-        time_vs_plan_vals = []
-        time_until_plan_vals = []
+        time_delta_vals = []  # Combined: time_until_plan and time_vs_plan
+        elapsed_vals = []
         distance_vals = []
         label_vals = []
         
         for _, row in df.iterrows():
             events = row['events']
             event_times = []
+            first_event_time = None
             
             for i, event in enumerate(events):
                 event_time = self._parse_datetime(event['event_time'])
                 if event_time is None:
                     continue
-                event_times.append(event_time)
                 
+                if first_event_time is None:
+                    first_event_time = event_time
+                
+                event_times.append(event_time)
                 prev_event = events[i-1] if i > 0 else None
                 
-                # Time since previous (REALIZED)
+                # Elapsed time
+                elapsed = (event_time - first_event_time).total_seconds() / 3600
+                elapsed_vals.append([elapsed])
+                
+                # Time since previous
                 if i > 0 and len(event_times) > 1:
                     time_since_prev = (event_time - event_times[-2]).total_seconds() / 3600
                     time_since_prev_vals.append([time_since_prev])
                 
-                # Dwelling time (REALIZED)
+                # Dwelling time
                 dwelling = (event.get('dwelling_seconds', 0) or 0) / 3600
                 dwelling_vals.append([dwelling])
                 
-                # Time vs plan (REALIZED)
+                # Time vs plan (realized)
                 plan_time = self._get_plan_time_for_event(event, prev_event)
                 plan_dt = self._parse_datetime(plan_time)
                 if plan_dt:
                     time_vs_plan = (event_time - plan_dt).total_seconds() / 3600
                     time_vs_plan = max(-720, min(time_vs_plan, 720))
-                    time_vs_plan_vals.append([time_vs_plan])
+                    time_delta_vals.append([time_vs_plan])
                 
-                # Time until next plan (OBSERVABLE)
+                # Time until next plan (observable)
                 if i < len(events) - 1:
                     next_event = events[i + 1]
                     next_plan_time = self._get_plan_time_for_event(next_event, event)
@@ -485,7 +576,7 @@ class PackageLifecyclePreprocessor:
                     if next_plan_dt:
                         time_until_plan = (next_plan_dt - event_time).total_seconds() / 3600
                         time_until_plan = max(-720, min(time_until_plan, 720))
-                        time_until_plan_vals.append([time_until_plan])
+                        time_delta_vals.append([time_until_plan])
                 
                 # Label (transit time)
                 if i < len(events) - 1:
@@ -505,8 +596,8 @@ class PackageLifecyclePreprocessor:
         # Fit scalers
         self._fit_scaler(self.time_since_prev_scaler, time_since_prev_vals, 'time_since_prev')
         self._fit_scaler(self.dwelling_time_scaler, dwelling_vals, 'dwelling')
-        self._fit_scaler(self.time_vs_plan_scaler, time_vs_plan_vals, 'time_vs_plan')
-        self._fit_scaler(self.time_until_plan_scaler, time_until_plan_vals, 'time_until_plan')
+        self._fit_scaler(self.time_delta_scaler, time_delta_vals, 'time_delta')
+        self._fit_scaler(self.elapsed_time_scaler, elapsed_vals, 'elapsed')
         self._fit_scaler(self.edge_distance_scaler, distance_vals, 'distance')
         self._fit_scaler(self.label_time_scaler, label_vals, 'label')
         
@@ -533,8 +624,8 @@ class PackageLifecyclePreprocessor:
         scalers = {
             'time_since_prev': self.time_since_prev_scaler,
             'dwelling_time': self.dwelling_time_scaler,
-            'time_vs_plan': self.time_vs_plan_scaler,
-            'time_until_plan': self.time_until_plan_scaler,
+            'time_delta': self.time_delta_scaler,
+            'elapsed_time': self.elapsed_time_scaler,
             'edge_distance': self.edge_distance_scaler,
             'label_time': self.label_time_scaler,
         }
@@ -548,82 +639,76 @@ class PackageLifecyclePreprocessor:
     
     def _extract_observable_features(self, event: Dict, prev_event: Dict,
                                       reference_time: datetime,
-                                      events: List[Dict], event_idx: int) -> np.ndarray:
+                                      first_event_time: datetime,
+                                      events: List[Dict], event_idx: int) -> Tuple[np.ndarray, np.ndarray]:
         """
         Extract OBSERVABLE features for an event.
-        These are features known BEFORE the event happens.
         
-        Used for: Target node, future nodes
-        
-        Features:
-        - time_until_plan (scaled): Time from reference to this event's plan
-        - has_plan: Flag if plan time exists
-        - is_delivery: Flag if this is a DELIVERY event
-        - plan_time cyclical (8): When event is planned
-        - position (1): Normalized position in sequence
+        Returns:
+            Tuple of (time_features, other_features)
+            - time_features: [6] for Time2Vec (hour, dow, dom, month, elapsed, time_until_plan)
+            - other_features: [3] (is_delivery, position, has_plan)
         """
         event_type = str(event.get('event_type', 'UNKNOWN'))
         num_events = len(events)
         
-        # Plan time for this event
         plan_time = self._get_plan_time_for_event(event, prev_event)
         plan_dt = self._parse_datetime(plan_time)
         
-        # Time until plan (from reference_time perspective)
+        # Calculate time until plan
         has_plan = 0.0
-        time_until_plan_scaled = 0.0
-        plan_cyclical = np.zeros(8, dtype=np.float32)
+        time_until_plan = 0.0
         
         if plan_dt and reference_time:
             has_plan = 1.0
             time_until_plan = (plan_dt - reference_time).total_seconds() / 3600
             time_until_plan = max(-720, min(time_until_plan, 720))
-            time_until_plan_scaled = self.time_until_plan_scaler.transform([[time_until_plan]])[0, 0]
-            
-            plan_features = self._extract_cyclical_time(plan_dt, prefix='')
-            plan_cyclical = np.array([
-                plan_features['hour_sin'], plan_features['hour_cos'],
-                plan_features['dow_sin'], plan_features['dow_cos'],
-                plan_features['dom_sin'], plan_features['dom_cos'],
-                plan_features['month_sin'], plan_features['month_cos'],
-            ], dtype=np.float32)
         
-        # Is delivery flag
+        # Scale time_until_plan
+        time_until_plan_scaled = self.time_delta_scaler.transform([[time_until_plan]])[0, 0]
+        
+        # Calculate elapsed time
+        elapsed_hours = (reference_time - first_event_time).total_seconds() / 3600 if reference_time else 0.0
+        elapsed_scaled = self.elapsed_time_scaler.transform([[elapsed_hours]])[0, 0]
+        
+        # Use plan_dt for time features if available, else reference_time
+        time_ref = plan_dt if plan_dt else reference_time
+        if time_ref is None:
+            time_ref = first_event_time
+        
+        # Raw time features for Time2Vec
+        time_features = np.array([
+            time_ref.hour + time_ref.minute / 60.0,  # hour (0-24)
+            time_ref.weekday(),                       # day of week (0-6)
+            time_ref.day,                             # day of month (1-31)
+            time_ref.month,                           # month (1-12)
+            elapsed_scaled,                           # elapsed (scaled)
+            time_until_plan_scaled,                   # time until plan (scaled)
+        ], dtype=np.float32)
+        
+        # Other observable features
         is_delivery = 1.0 if event_type == 'DELIVERY' else 0.0
-        
-        # Position in sequence (normalized)
         position = event_idx / max(1, num_events - 1)
         
-        # Combine observable features
-        # Total: 1 + 1 + 1 + 8 + 1 = 12
-        observable = np.concatenate([
-            [time_until_plan_scaled],  # 1
-            [has_plan],                # 1
-            [is_delivery],             # 1
-            plan_cyclical,             # 8
-            [position],                # 1
-        ]).astype(np.float32)
+        other_features = np.array([
+            is_delivery,
+            position,
+            has_plan,
+        ], dtype=np.float32)
         
-        return observable
+        return time_features, other_features
     
     def _extract_realized_features(self, event: Dict, prev_event: Dict,
                                     prev_time: Optional[datetime],
-                                    events: List[Dict], event_idx: int) -> np.ndarray:
+                                    first_event_time: datetime,
+                                    events: List[Dict], event_idx: int) -> Tuple[np.ndarray, np.ndarray]:
         """
         Extract REALIZED features for an event.
-        These are features only known AFTER the event happens.
         
-        Used for: Source node, past nodes
-        
-        Features:
-        - time_since_prev (scaled): Time since previous event
-        - dwelling (scaled): Dwelling time at location
-        - has_dwelling: Flag if dwelling > 0
-        - time_vs_plan (scaled): How late/early vs plan
-        - actual_time cyclical (8): When event actually happened
-        - missort flag: If package was missorted
-        - has_problem flag: If problems discovered
-        - problem_encoding: Multi-hot encoding of problems
+        Returns:
+            Tuple of (time_features, other_features)
+            - time_features: [6] for Time2Vec (hour, dow, dom, month, elapsed, time_vs_plan)
+            - other_features: [4 + num_problems] (time_since_prev, dwelling, has_dwelling, missort, has_problem, problems...)
         """
         event_type = str(event.get('event_type', ''))
         event_time = self._parse_datetime(event['event_time'])
@@ -634,32 +719,38 @@ class PackageLifecyclePreprocessor:
             time_since_prev = (event_time - prev_time).total_seconds() / 3600
             time_since_prev_scaled = self.time_since_prev_scaler.transform([[time_since_prev]])[0, 0]
         
-        # Dwelling time
+        # Dwelling
         dwelling = (event.get('dwelling_seconds', 0) or 0) / 3600
         dwelling_scaled = self.dwelling_time_scaler.transform([[dwelling]])[0, 0]
         has_dwelling = 1.0 if dwelling > 0 else 0.0
         
-        # Time vs plan (how late/early)
+        # Time vs plan
         plan_time = self._get_plan_time_for_event(event, prev_event)
         plan_dt = self._parse_datetime(plan_time)
-        time_vs_plan_scaled = 0.0
+        time_vs_plan = 0.0
         if plan_dt and event_time:
             time_vs_plan = (event_time - plan_dt).total_seconds() / 3600
             time_vs_plan = max(-720, min(time_vs_plan, 720))
-            time_vs_plan_scaled = self.time_vs_plan_scaler.transform([[time_vs_plan]])[0, 0]
+        time_vs_plan_scaled = self.time_delta_scaler.transform([[time_vs_plan]])[0, 0]
         
-        # Actual event time cyclical features
-        actual_cyclical = np.zeros(8, dtype=np.float32)
+        # Elapsed time
+        elapsed_hours = (event_time - first_event_time).total_seconds() / 3600 if event_time and first_event_time else 0.0
+        elapsed_scaled = self.elapsed_time_scaler.transform([[elapsed_hours]])[0, 0]
+        
+        # Raw time features for Time2Vec (using actual event time)
         if event_time:
-            actual_features = self._extract_cyclical_time(event_time, prefix='')
-            actual_cyclical = np.array([
-                actual_features['hour_sin'], actual_features['hour_cos'],
-                actual_features['dow_sin'], actual_features['dow_cos'],
-                actual_features['dom_sin'], actual_features['dom_cos'],
-                actual_features['month_sin'], actual_features['month_cos'],
+            time_features = np.array([
+                event_time.hour + event_time.minute / 60.0,
+                event_time.weekday(),
+                event_time.day,
+                event_time.month,
+                elapsed_scaled,
+                time_vs_plan_scaled,
             ], dtype=np.float32)
+        else:
+            time_features = np.zeros(6, dtype=np.float32)
         
-        # Missort flag
+        # Missort
         missort = 0.0
         if event_type in ['INDUCT', 'LINEHAUL']:
             missort = float(event.get('missort', False))
@@ -667,62 +758,44 @@ class PackageLifecyclePreprocessor:
         # Problem encoding
         problem_encoding, has_problem = self._get_exit_problem(event, events, event_idx)
         
-        # Combine realized features
-        # Total: 1 + 1 + 1 + 1 + 8 + 1 + 1 + len(problem_types) = 14 + len(problem_types)
-        realized = np.concatenate([
-            [time_since_prev_scaled],  # 1
-            [dwelling_scaled],         # 1
-            [has_dwelling],            # 1
-            [time_vs_plan_scaled],     # 1
-            actual_cyclical,           # 8
-            [missort],                 # 1
-            [has_problem],             # 1
-            problem_encoding,          # len(problem_types)
+        # Other realized features
+        other_features = np.concatenate([
+            [time_since_prev_scaled],
+            [dwelling_scaled],
+            [has_dwelling],
+            [missort],
+            [has_problem],
+            problem_encoding,
         ]).astype(np.float32)
         
-        return realized
+        return time_features, other_features
     
     def _extract_edge_features(self, source_event: Dict, target_event: Dict,
                                 source_time: datetime) -> np.ndarray:
-        """
-        Extract edge features (all OBSERVABLE - based on known info).
-        
-        Features:
-        - distance (scaled): Distance between locations
-        - has_distance: Flag if distance is known
-        - same_location: Flag if same location
-        - cross_region: Flag if crossing regions
-        - source_time cyclical (4): Hour and day of week from source
-        """
+        """Extract edge features."""
         source_loc = self._get_location(source_event)
         target_loc = self._get_location(target_event)
         
-        # Distance
         distance, has_distance = self._get_distance(source_loc, target_loc)
         distance_scaled = self.edge_distance_scaler.transform([[distance]])[0, 0]
         
-        # Same location flag
         same_location = float(source_loc == target_loc and source_loc != 'UNKNOWN')
         
-        # Cross-region flag
         source_region = self._get_region(source_loc)
         target_region = self._get_region(target_loc)
         cross_region = float(source_region != target_region and 
                             source_region != 'UNKNOWN' and target_region != 'UNKNOWN')
         
-        # Source time features (4 features: hour sin/cos, dow sin/cos)
-        source_time_features = self._extract_cyclical_time(source_time, prefix='')
-        
-        # Total: 1 + 1 + 1 + 1 + 4 = 8
+        # Raw time features for edge (source time)
         edge_features = np.array([
             distance_scaled,
             float(has_distance),
             same_location,
             cross_region,
-            source_time_features['hour_sin'],
-            source_time_features['hour_cos'],
-            source_time_features['dow_sin'],
-            source_time_features['dow_cos'],
+            source_time.hour + source_time.minute / 60.0,  # hour
+            source_time.weekday(),                          # dow
+            source_time.day,                                # dom
+            source_time.month,                              # month
         ], dtype=np.float32)
         
         return edge_features
@@ -732,20 +805,7 @@ class PackageLifecyclePreprocessor:
     # =========================================================================
     
     def process_lifecycle(self, package_data: Dict, return_labels: bool = True) -> Dict:
-        """
-        Process a package lifecycle with CAUSAL feature extraction.
-        
-        Returns:
-        - node_observable_features: (N, observable_dim) - always available
-        - node_realized_features: (N, realized_dim) - only for past nodes
-        - node_categorical_indices: Dict of (N,) arrays
-        - edge_index: (2, E) - sequential edges
-        - edge_features: (E, edge_dim)
-        - package_features: (package_dim,)
-        - package_categorical: Dict with source/dest postal
-        - labels: (E, 1) - transit times (scaled)
-        - labels_raw: (E, 1) - transit times (hours)
-        """
+        """Process a package lifecycle with Time2Vec-ready features."""
         if not self.fitted:
             raise ValueError("Preprocessor must be fitted before processing")
         
@@ -755,7 +815,6 @@ class PackageLifecyclePreprocessor:
         if num_events < 1:
             raise ValueError("Package must have at least 1 event")
         
-        # Parse all event times
         event_times = []
         for event in events:
             et = self._parse_datetime(event['event_time'])
@@ -763,9 +822,14 @@ class PackageLifecyclePreprocessor:
                 raise ValueError("Invalid event_time")
             event_times.append(et)
         
-        # === Extract features for ALL nodes ===
-        node_observable_features = []
-        node_realized_features = []
+        first_event_time = event_times[0]
+        
+        # Feature arrays
+        node_observable_time = []
+        node_observable_other = []
+        node_realized_time = []
+        node_realized_other = []
+        
         node_categorical_indices = {
             'event_type': [], 'location': [], 'postal': [], 'region': [],
             'carrier': [], 'leg_type': [], 'ship_method': [],
@@ -775,21 +839,21 @@ class PackageLifecyclePreprocessor:
             event_type = str(event.get('event_type', 'UNKNOWN'))
             prev_event = events[i-1] if i > 0 else None
             prev_time = event_times[i-1] if i > 0 else None
-            
-            # Reference time for observable features
             reference_time = prev_time if i > 0 else event_times[0]
             
             # Observable features
-            obs_features = self._extract_observable_features(
-                event, prev_event, reference_time, events, i
+            obs_time, obs_other = self._extract_observable_features(
+                event, prev_event, reference_time, first_event_time, events, i
             )
-            node_observable_features.append(obs_features)
+            node_observable_time.append(obs_time)
+            node_observable_other.append(obs_other)
             
             # Realized features
-            real_features = self._extract_realized_features(
-                event, prev_event, prev_time, events, i
+            real_time, real_other = self._extract_realized_features(
+                event, prev_event, prev_time, first_event_time, events, i
             )
-            node_realized_features.append(real_features)
+            node_realized_time.append(real_time)
+            node_realized_other.append(real_other)
             
             # Categorical indices
             location = self._get_location(event)
@@ -797,34 +861,37 @@ class PackageLifecyclePreprocessor:
             region = self._get_region(location)
             
             node_categorical_indices['event_type'].append(
-                self._safe_encode(self.event_type_encoder, event_type)
+                self._safe_encode(self.event_type_encoder, event_type, 'event_type')
             )
             node_categorical_indices['location'].append(
-                self._safe_encode(self.location_encoder, location)
+                self._safe_encode(self.location_encoder, location, 'location')
             )
             node_categorical_indices['postal'].append(
-                self._safe_encode(self.postal_encoder, postal)
+                self._safe_encode(self.postal_encoder, postal, 'postal')
             )
             node_categorical_indices['region'].append(
-                self._safe_encode(self.region_encoder, region)
+                self._safe_encode(self.region_encoder, region, 'region')
             )
             node_categorical_indices['carrier'].append(
-                self._safe_encode(self.carrier_encoder, event.get('carrier_id'))
+                self._safe_encode(self.carrier_encoder, event.get('carrier_id'), 'carrier')
             )
             node_categorical_indices['leg_type'].append(
-                self._safe_encode(self.leg_type_encoder, event.get('leg_type'))
+                self._safe_encode(self.leg_type_encoder, event.get('leg_type'), 'leg_type')
             )
             node_categorical_indices['ship_method'].append(
-                self._safe_encode(self.ship_method_encoder, event.get('ship_method'))
+                self._safe_encode(self.ship_method_encoder, event.get('ship_method'), 'ship_method')
             )
         
-        node_observable_features = np.array(node_observable_features, dtype=np.float32)
-        node_realized_features = np.array(node_realized_features, dtype=np.float32)
+        # Convert to arrays
+        node_observable_time = np.array(node_observable_time, dtype=np.float32)
+        node_observable_other = np.array(node_observable_other, dtype=np.float32)
+        node_realized_time = np.array(node_realized_time, dtype=np.float32)
+        node_realized_other = np.array(node_realized_other, dtype=np.float32)
         
         for key in node_categorical_indices:
             node_categorical_indices[key] = np.array(node_categorical_indices[key], dtype=np.int64)
         
-        # === Package features ===
+        # Package features
         package_features = np.array([
             package_data.get('weight', 0) or 0,
             package_data.get('length', 0) or 0,
@@ -833,7 +900,7 @@ class PackageLifecyclePreprocessor:
         ], dtype=np.float32).reshape(1, -1)
         package_features_scaled = self.package_feature_scaler.transform(package_features).flatten()
         
-        # === Edge features ===
+        # Edge features
         edge_index = []
         edge_features = []
         
@@ -851,23 +918,38 @@ class PackageLifecyclePreprocessor:
             edge_index = np.zeros((2, 0), dtype=np.int64)
             edge_features = np.zeros((0, 8), dtype=np.float32)
         
-        # === Build result ===
         result = {
-            'node_observable_features': node_observable_features,
-            'node_realized_features': node_realized_features,
+            # Time features (for Time2Vec)
+            'node_observable_time': node_observable_time,    # [num_nodes, 6]
+            'node_realized_time': node_realized_time,        # [num_nodes, 6]
+            
+            # Other features
+            'node_observable_other': node_observable_other,  # [num_nodes, 3]
+            'node_realized_other': node_realized_other,      # [num_nodes, 5 + num_problems]
+            
+            # Categorical indices
             'node_categorical_indices': node_categorical_indices,
+            
+            # Edge features
             'edge_index': edge_index,
             'edge_features': edge_features,
+            
+            # Package features
             'package_features': package_features_scaled,
             'package_categorical': {
-                'source_postal': self._safe_encode(self.postal_encoder, package_data.get('source_postal')),
-                'dest_postal': self._safe_encode(self.postal_encoder, package_data.get('dest_postal')),
+                'source_postal': self._safe_encode(
+                    self.postal_encoder, package_data.get('source_postal'), 'source_postal'
+                ),
+                'dest_postal': self._safe_encode(
+                    self.postal_encoder, package_data.get('dest_postal'), 'dest_postal'
+                ),
             },
+            
+            # Metadata
             'num_nodes': num_events,
             'package_id': package_data.get('package_id', 'unknown'),
         }
         
-        # === Labels ===
         if return_labels:
             labels = []
             for i in range(num_events - 1):
@@ -911,24 +993,14 @@ class PackageLifecyclePreprocessor:
         if not self.fitted:
             raise ValueError("Preprocessor must be fitted first")
         
-        # Observable: time_until_plan(1) + has_plan(1) + is_delivery(1) + plan_cyclical(8) + position(1) = 12
-        observable_dim = 12
-        
-        # Realized: time_since_prev(1) + dwelling(2) + time_vs_plan(1) + actual_cyclical(8) + flags(2) + problems
-        realized_dim = 14 + len(self.problem_types)
-        
-        # Edge: distance(2) + same_loc(1) + cross_region(1) + source_time(4) = 8
-        edge_dim = 8
-        
-        # Package: weight, length, width, height = 4
-        package_dim = 4
-        
         return {
             'vocab_sizes': self.vocab_sizes.copy(),
-            'observable_dim': observable_dim,
-            'realized_dim': realized_dim,
-            'edge_dim': edge_dim,
-            'package_dim': package_dim,
+            'observable_time_dim': 6,
+            'observable_other_dim': 3,
+            'realized_time_dim': 6,
+            'realized_other_dim': 5 + len(self.problem_types),
+            'edge_dim': 8,
+            'package_dim': 4,
             'num_problem_types': len(self.problem_types),
         }
     
@@ -936,16 +1008,56 @@ class PackageLifecyclePreprocessor:
         """Get vocabulary sizes for embedding layers."""
         return self.vocab_sizes.copy()
     
+    def get_postal_code_count(self) -> int:
+        """Get the number of postal codes in the vocabulary."""
+        return self.vocab_sizes.get('postal', 0)
+    
+    def get_zip_codes(self) -> List[str]:
+        """Get the list of zip codes used."""
+        if self.fitted:
+            return [c for c in self.postal_encoder.classes_ if c not in ['PAD', 'UNKNOWN']]
+        return self.zip_codes.copy()
+    
+    # =========================================================================
+    # SAVE / LOAD
+    # =========================================================================
+    
     def save(self, path: str):
-        """Save preprocessor to file."""
-        with open(path, 'wb') as f:
-            pickle.dump(self, f)
-        print(f"Preprocessor saved to {path}")
+        """Save preprocessor to file (local or S3)."""
+        if path.startswith('s3://'):
+            import boto3
+            
+            buffer = io.BytesIO()
+            pickle.dump(self, buffer)
+            buffer.seek(0)
+            
+            path_clean = path.replace('s3://', '')
+            bucket, key = path_clean.split('/', 1)
+            boto3.client('s3').put_object(Bucket=bucket, Key=key, Body=buffer.getvalue())
+            print(f"Preprocessor saved to {path}")
+        else:
+            dir_path = os.path.dirname(path)
+            if dir_path:
+                os.makedirs(dir_path, exist_ok=True)
+            with open(path, 'wb') as f:
+                pickle.dump(self, f)
+            print(f"Preprocessor saved to {path}")
     
     @staticmethod
     def load(path: str) -> 'PackageLifecyclePreprocessor':
-        """Load preprocessor from file."""
-        with open(path, 'rb') as f:
-            preprocessor = pickle.load(f)
-        print(f"Preprocessor loaded from {path}")
-        return preprocessor
+        """Load preprocessor from file (local or S3)."""
+        if path.startswith('s3://'):
+            import boto3
+            
+            path_clean = path.replace('s3://', '')
+            bucket, key = path_clean.split('/', 1)
+            response = boto3.client('s3').get_object(Bucket=bucket, Key=key)
+            buffer = io.BytesIO(response['Body'].read())
+            preprocessor = pickle.load(buffer)
+            print(f"Preprocessor loaded from {path}")
+            return preprocessor
+        else:
+            with open(path, 'rb') as f:
+                preprocessor = pickle.load(f)
+            print(f"Preprocessor loaded from {path}")
+            return preprocessor

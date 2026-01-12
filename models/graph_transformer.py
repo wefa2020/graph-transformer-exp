@@ -1,5 +1,5 @@
 """
-models/causal_graph_transformer.py - Optimized Causal Graph Transformer
+models/causal_graph_transformer.py - Optimized Causal Graph Transformer with Time2Vec
 
 Handles variable length sequences with ZERO feature leakage.
 Labels are organized by package, but processing is optimized by position.
@@ -13,6 +13,283 @@ import math
 from typing import Dict, List, Optional, Tuple
 from collections import defaultdict
 
+
+# ════════════════════════════════════════════════════════════════════════════════
+# TIME2VEC MODULE
+# ════════════════════════════════════════════════════════════════════════════════
+
+class Time2Vec(nn.Module):
+    """
+    Time2Vec: Learnable time representation.
+    
+    t2v(τ)[i] = ω_i × τ + φ_i,           if i = 0  (linear term)
+    t2v(τ)[i] = sin(ω_i × τ + φ_i),      if i > 0  (periodic terms)
+    
+    Reference: "Time2Vec: Learning to Time" (Kazemi et al., 2019)
+    """
+    
+    def __init__(self, input_dim: int = 1, embed_dim: int = 16, 
+                 activation: str = 'sin'):
+        """
+        Args:
+            input_dim: Number of input time features
+            embed_dim: Output embedding dimension (must be >= 1)
+            activation: 'sin' or 'cos' for periodic terms
+        """
+        super().__init__()
+        self.input_dim = input_dim
+        self.embed_dim = embed_dim
+        self.activation = torch.sin if activation == 'sin' else torch.cos
+        
+        # Linear term parameters (first dimension)
+        self.W_linear = nn.Parameter(torch.randn(input_dim, 1))
+        self.b_linear = nn.Parameter(torch.randn(1))
+        
+        # Periodic term parameters (remaining dimensions)
+        if embed_dim > 1:
+            self.W_periodic = nn.Parameter(torch.randn(input_dim, embed_dim - 1))
+            self.b_periodic = nn.Parameter(torch.randn(embed_dim - 1))
+        else:
+            self.register_parameter('W_periodic', None)
+            self.register_parameter('b_periodic', None)
+        
+        self._init_parameters()
+    
+    def _init_parameters(self):
+        """Initialize parameters for stable training."""
+        with torch.no_grad():
+            # Linear term: small values
+            nn.init.uniform_(self.W_linear, -0.1, 0.1)
+            nn.init.zeros_(self.b_linear)
+            
+            # Periodic terms: initialize frequencies for different time scales
+            if self.W_periodic is not None:
+                num_periodic = self.embed_dim - 1
+                # Log-spaced frequencies from hourly to yearly
+                frequencies = torch.logspace(
+                    math.log10(2 * math.pi / 24),      # Hourly
+                    math.log10(2 * math.pi / 8760),   # Yearly
+                    num_periodic
+                )
+                self.W_periodic.data = frequencies.unsqueeze(0).expand(self.input_dim, -1).clone()
+                nn.init.uniform_(self.b_periodic, -math.pi, math.pi)
+    
+    def forward(self, t: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            t: Time values [..., input_dim]
+        
+        Returns:
+            Time embeddings [..., embed_dim]
+        """
+        original_shape = t.shape[:-1]
+        t = t.reshape(-1, self.input_dim)  # [batch, input_dim]
+        
+        # Linear term: [batch, 1]
+        linear = torch.matmul(t, self.W_linear) + self.b_linear
+        
+        if self.W_periodic is not None:
+            # Periodic terms: [batch, embed_dim - 1]
+            periodic = self.activation(torch.matmul(t, self.W_periodic) + self.b_periodic)
+            # Combine: [batch, embed_dim]
+            output = torch.cat([linear, periodic], dim=-1)
+        else:
+            output = linear
+        
+        # Reshape back
+        return output.reshape(*original_shape, self.embed_dim)
+
+
+class MultiScaleTime2Vec(nn.Module):
+    """
+    Multi-scale Time2Vec for processing multiple time features.
+    
+    Input features (from preprocessor):
+    - hour (0-24): Hour of day as float
+    - day_of_week (0-6): Day of week
+    - day_of_month (1-31): Day of month
+    - month (1-12): Month of year
+    - elapsed_hours: Hours since journey start (scaled)
+    - time_delta: Time until plan OR time vs plan (scaled)
+    """
+    
+    def __init__(self, embed_dim: int = 32, dropout: float = 0.1,
+                 use_raw_cyclical_hybrid: bool = True):
+        """
+        Args:
+            embed_dim: Final output embedding dimension
+            dropout: Dropout rate
+            use_raw_cyclical_hybrid: If True, also include raw cyclical features
+        """
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.use_hybrid = use_raw_cyclical_hybrid
+        
+        # Individual Time2Vec for each time aspect
+        self.hour_t2v = Time2Vec(input_dim=1, embed_dim=8)      # Hour of day
+        self.dow_t2v = Time2Vec(input_dim=1, embed_dim=4)       # Day of week
+        self.dom_t2v = Time2Vec(input_dim=1, embed_dim=4)       # Day of month
+        self.month_t2v = Time2Vec(input_dim=1, embed_dim=4)     # Month
+        self.elapsed_t2v = Time2Vec(input_dim=1, embed_dim=8)   # Elapsed time
+        self.delta_t2v = Time2Vec(input_dim=1, embed_dim=8)     # Time delta
+        
+        # Calculate input dimension for projection
+        t2v_dim = 8 + 4 + 4 + 4 + 8 + 8  # 36
+        cyclical_dim = 8 if use_raw_cyclical_hybrid else 0  # sin/cos for hour, dow, dom, month
+        total_input = t2v_dim + cyclical_dim
+        
+        # Project to final dimension
+        self.proj = nn.Sequential(
+            nn.Linear(total_input, embed_dim),
+            nn.LayerNorm(embed_dim),
+            nn.GELU(),
+            nn.Dropout(dropout)
+        )
+        
+        self._init_weights()
+    
+    def _init_weights(self):
+        for layer in self.proj:
+            if isinstance(layer, nn.Linear):
+                nn.init.xavier_uniform_(layer.weight)
+                if layer.bias is not None:
+                    nn.init.zeros_(layer.bias)
+    
+    def forward(self, time_features: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            time_features: [..., 6] containing:
+                - hour (0-24)
+                - day_of_week (0-6)
+                - day_of_month (1-31)
+                - month (1-12)
+                - elapsed (scaled)
+                - time_delta (scaled)
+        
+        Returns:
+            Time embedding [..., embed_dim]
+        """
+        # Split input features
+        hour = time_features[..., 0:1]
+        dow = time_features[..., 1:2]
+        dom = time_features[..., 2:3]
+        month = time_features[..., 3:4]
+        elapsed = time_features[..., 4:5]
+        delta = time_features[..., 5:6]
+        
+        # Apply Time2Vec to each component
+        h_emb = self.hour_t2v(hour)         # [..., 8]
+        d_emb = self.dow_t2v(dow)           # [..., 4]
+        dm_emb = self.dom_t2v(dom)          # [..., 4]
+        m_emb = self.month_t2v(month)       # [..., 4]
+        e_emb = self.elapsed_t2v(elapsed)   # [..., 8]
+        td_emb = self.delta_t2v(delta)      # [..., 8]
+        
+        embeddings = [h_emb, d_emb, dm_emb, m_emb, e_emb, td_emb]
+        
+        # Optionally add raw cyclical features as baseline
+        if self.use_hybrid:
+            hour_rad = hour * (2 * math.pi / 24)
+            dow_rad = dow * (2 * math.pi / 7)
+            dom_rad = dom * (2 * math.pi / 31)
+            month_rad = month * (2 * math.pi / 12)
+            
+            cyclical = torch.cat([
+                torch.sin(hour_rad),
+                torch.cos(hour_rad),
+                torch.sin(dow_rad),
+                torch.cos(dow_rad),
+                torch.sin(dom_rad),
+                torch.cos(dom_rad),
+                torch.sin(month_rad),
+                torch.cos(month_rad),
+            ], dim=-1)
+            embeddings.append(cyclical)
+        
+        combined = torch.cat(embeddings, dim=-1)
+        return self.proj(combined)
+
+
+class EdgeTime2Vec(nn.Module):
+    """
+    Time2Vec for edge features.
+    
+    Input features (from preprocessor edge_features):
+    - distance_scaled
+    - has_distance
+    - same_location
+    - cross_region
+    - hour (0-24)
+    - dow (0-6)
+    - dom (1-31)
+    - month (1-12)
+    """
+    
+    def __init__(self, embed_dim: int = 32, dropout: float = 0.1):
+        super().__init__()
+        self.embed_dim = embed_dim
+        
+        # Time2Vec for time components
+        self.hour_t2v = Time2Vec(input_dim=1, embed_dim=8)
+        self.dow_t2v = Time2Vec(input_dim=1, embed_dim=4)
+        self.dom_t2v = Time2Vec(input_dim=1, embed_dim=4)
+        self.month_t2v = Time2Vec(input_dim=1, embed_dim=4)
+        
+        # Non-time features: distance_scaled, has_distance, same_location, cross_region = 4
+        # Time2Vec: 8 + 4 + 4 + 4 = 20
+        # Cyclical: 8
+        total_input = 4 + 20 + 8
+        
+        self.proj = nn.Sequential(
+            nn.Linear(total_input, embed_dim),
+            nn.LayerNorm(embed_dim),
+            nn.GELU(),
+            nn.Dropout(dropout)
+        )
+    
+    def forward(self, edge_features: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            edge_features: [E, 8] - distance, has_dist, same_loc, cross_region, hour, dow, dom, month
+        
+        Returns:
+            Edge embedding [E, embed_dim]
+        """
+        # Non-time features
+        non_time = edge_features[..., :4]  # [E, 4]
+        
+        # Time features
+        hour = edge_features[..., 4:5]
+        dow = edge_features[..., 5:6]
+        dom = edge_features[..., 6:7]
+        month = edge_features[..., 7:8]
+        
+        # Time2Vec embeddings
+        h_emb = self.hour_t2v(hour)
+        d_emb = self.dow_t2v(dow)
+        dm_emb = self.dom_t2v(dom)
+        m_emb = self.month_t2v(month)
+        
+        # Cyclical features
+        hour_rad = hour * (2 * math.pi / 24)
+        dow_rad = dow * (2 * math.pi / 7)
+        dom_rad = dom * (2 * math.pi / 31)
+        month_rad = month * (2 * math.pi / 12)
+        
+        cyclical = torch.cat([
+            torch.sin(hour_rad), torch.cos(hour_rad),
+            torch.sin(dow_rad), torch.cos(dow_rad),
+            torch.sin(dom_rad), torch.cos(dom_rad),
+            torch.sin(month_rad), torch.cos(month_rad),
+        ], dim=-1)
+        
+        combined = torch.cat([non_time, h_emb, d_emb, dm_emb, m_emb, cyclical], dim=-1)
+        return self.proj(combined)
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# MULTI-EMBEDDING MODULE
+# ════════════════════════════════════════════════════════════════════════════════
 
 class MultiEmbedding(nn.Module):
     """Module for handling multiple categorical embeddings."""
@@ -59,6 +336,10 @@ class MultiEmbedding(nn.Module):
         return len(self.feature_names) * self.embed_dim
 
 
+# ════════════════════════════════════════════════════════════════════════════════
+# POSITIONAL ENCODING
+# ════════════════════════════════════════════════════════════════════════════════
+
 class PositionalEncoding(nn.Module):
     """Sinusoidal positional encoding."""
     
@@ -82,6 +363,10 @@ class PositionalEncoding(nn.Module):
         positions = positions.clamp(0, self.pe.size(0) - 1)
         return x + self.pe[positions]
 
+
+# ════════════════════════════════════════════════════════════════════════════════
+# GRAPH TRANSFORMER LAYER
+# ════════════════════════════════════════════════════════════════════════════════
 
 class GraphTransformerLayer(nn.Module):
     """Graph Transformer layer with edge features."""
@@ -124,9 +409,22 @@ class GraphTransformerLayer(nn.Module):
         return x
 
 
+# ════════════════════════════════════════════════════════════════════════════════
+# CAUSAL GRAPH TRANSFORMER
+# ════════════════════════════════════════════════════════════════════════════════
+
 class CausalGraphTransformer(nn.Module):
     """
-    Optimized Causal Graph Transformer for Transit Time Prediction.
+    Optimized Causal Graph Transformer for Transit Time Prediction with Time2Vec.
+    
+    ════════════════════════════════════════════════════════════════════════════
+    TIME2VEC INTEGRATION
+    ════════════════════════════════════════════════════════════════════════════
+    
+    Uses learnable Time2Vec representations for:
+    - Observable time features: plan time, elapsed time, time until plan
+    - Realized time features: actual event time, elapsed, time vs plan
+    - Edge time features: source event time
     
     ════════════════════════════════════════════════════════════════════════════
     CAUSAL MASKING - ZERO FEATURE LEAKAGE
@@ -136,27 +434,12 @@ class CausalGraphTransformer(nn.Module):
     - Nodes at position ≤ source position: use OBSERVABLE + REALIZED features
     - Nodes at position > source position: use OBSERVABLE + ZEROS (realized masked)
     
-    This ensures no information from future events leaks into predictions.
-    
     ════════════════════════════════════════════════════════════════════════════
     OPTIMIZATION - PROCESS BY POSITION
     ════════════════════════════════════════════════════════════════════════════
     
-    Instead of running transformer once per edge (O(E) passes),
-    we run once per unique source position (O(P) passes where P << E).
-    
-    Edges with same source position share the same causal mask!
-    
+    Edges with same source position share the same causal mask.
     Speedup: E/P ≈ (batch_size × avg_edges_per_package) / max_seq_len ≈ 100-1000x
-    
-    ════════════════════════════════════════════════════════════════════════════
-    VARIABLE LENGTH HANDLING
-    ════════════════════════════════════════════════════════════════════════════
-    
-    Each package can have different number of events. Handled automatically:
-    - Position tensor tracks each node's position within its package
-    - Edges grouped by source position (not by package)
-    - Labels stored by package, predictions stored at original edge indices
     
     ════════════════════════════════════════════════════════════════════════════
     """
@@ -170,6 +453,7 @@ class CausalGraphTransformer(nn.Module):
         num_heads: int = 8,
         dropout: float = 0.1,
         embed_dim: int = 32,
+        time2vec_dim: int = 32,
         output_dim: int = 1,
         use_edge_features: bool = True,
     ):
@@ -180,12 +464,35 @@ class CausalGraphTransformer(nn.Module):
         self.num_heads = num_heads
         self.output_dim = output_dim
         self.use_edge_features = use_edge_features
+        self.time2vec_dim = time2vec_dim
         
-        # Store dimensions
-        self.observable_dim = feature_dims.get('observable_dim', 11)
-        self.realized_dim = feature_dims.get('realized_dim', 20)
+        # Store dimensions from preprocessor
+        self.observable_time_dim = feature_dims.get('observable_time_dim', 6)
+        self.observable_other_dim = feature_dims.get('observable_other_dim', 3)
+        self.realized_time_dim = feature_dims.get('realized_time_dim', 6)
+        self.realized_other_dim = feature_dims.get('realized_other_dim', 20)
         self.edge_dim = feature_dims.get('edge_dim', 8)
         self.package_dim = feature_dims.get('package_dim', 4)
+        
+        # ════════════════════════════════════════════════════════════════
+        # TIME2VEC MODULES
+        # ════════════════════════════════════════════════════════════════
+        self.observable_time2vec = MultiScaleTime2Vec(
+            embed_dim=time2vec_dim,
+            dropout=dropout,
+            use_raw_cyclical_hybrid=True
+        )
+        
+        self.realized_time2vec = MultiScaleTime2Vec(
+            embed_dim=time2vec_dim,
+            dropout=dropout,
+            use_raw_cyclical_hybrid=True
+        )
+        
+        self.edge_time2vec = EdgeTime2Vec(
+            embed_dim=time2vec_dim,
+            dropout=dropout
+        )
         
         # ════════════════════════════════════════════════════════════════
         # NODE CATEGORICAL EMBEDDINGS
@@ -194,7 +501,6 @@ class CausalGraphTransformer(nn.Module):
             'event_type', 'location', 'postal', 'region',
             'carrier', 'leg_type', 'ship_method'
         ]
-        # Filter to only features that exist in vocab_sizes
         self.node_categorical_features = [
             f for f in node_categorical_features if f in vocab_sizes
         ]
@@ -224,23 +530,35 @@ class CausalGraphTransformer(nn.Module):
         node_cat_dim = self.node_embedding.get_output_dim()
         package_postal_dim = embed_dim * 2  # source + dest postal
         
+        # Observable: Time2Vec + other continuous + categorical + package
         observable_input_dim = (
-            self.observable_dim +      # continuous observable features
+            time2vec_dim +             # Time2Vec embedding
+            self.observable_other_dim + # other continuous (is_delivery, position, has_plan)
             node_cat_dim +             # categorical embeddings
             package_postal_dim +       # package postal embeddings
             self.package_dim           # package features
         )
         
+        # Realized: Time2Vec + other continuous
+        realized_input_dim = (
+            time2vec_dim +             # Time2Vec embedding
+            self.realized_other_dim    # other continuous (time_since_prev, dwelling, missort, problems)
+        )
+        
         print(f"\n{'='*70}")
-        print(f"CAUSAL GRAPH TRANSFORMER (Optimized)")
+        print(f"CAUSAL GRAPH TRANSFORMER (with Time2Vec)")
         print(f"{'='*70}")
+        print(f"Time2Vec dimension: {time2vec_dim}")
         print(f"Observable input: {observable_input_dim}")
-        print(f"  - Continuous: {self.observable_dim}")
+        print(f"  - Time2Vec: {time2vec_dim}")
+        print(f"  - Other continuous: {self.observable_other_dim}")
         print(f"  - Categorical ({len(self.node_categorical_features)}): {node_cat_dim}")
         print(f"  - Package postal: {package_postal_dim}")
         print(f"  - Package features: {self.package_dim}")
-        print(f"Realized input: {self.realized_dim}")
-        print(f"Edge input: {self.edge_dim}")
+        print(f"Realized input: {realized_input_dim}")
+        print(f"  - Time2Vec: {time2vec_dim}")
+        print(f"  - Other continuous: {self.realized_other_dim}")
+        print(f"Edge input: {time2vec_dim} (via EdgeTime2Vec)")
         print(f"Hidden dim: {hidden_dim}")
         print(f"Layers: {num_layers}, Heads: {num_heads}")
         print(f"{'='*70}")
@@ -259,7 +577,7 @@ class CausalGraphTransformer(nn.Module):
         
         # Project realized features → hidden_dim
         self.realized_proj = nn.Sequential(
-            nn.Linear(self.realized_dim, hidden_dim),
+            nn.Linear(realized_input_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
             nn.GELU(),
             nn.Dropout(dropout)
@@ -268,14 +586,6 @@ class CausalGraphTransformer(nn.Module):
         # Combine observable + masked realized → hidden_dim
         self.combine_proj = nn.Sequential(
             nn.Linear(hidden_dim * 2, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.GELU(),
-            nn.Dropout(dropout)
-        )
-        
-        # Project edge features → hidden_dim
-        self.edge_proj = nn.Sequential(
-            nn.Linear(self.edge_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
             nn.GELU(),
             nn.Dropout(dropout)
@@ -294,7 +604,7 @@ class CausalGraphTransformer(nn.Module):
                 hidden_dim=hidden_dim,
                 num_heads=num_heads,
                 dropout=dropout,
-                edge_dim=hidden_dim if use_edge_features else None
+                edge_dim=time2vec_dim if use_edge_features else None
             )
             for _ in range(num_layers)
         ])
@@ -303,7 +613,7 @@ class CausalGraphTransformer(nn.Module):
         # OUTPUT HEAD
         # ════════════════════════════════════════════════════════════════
         self.output_head = nn.Sequential(
-            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.Linear(hidden_dim + time2vec_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
             nn.GELU(),
             nn.Dropout(dropout),
@@ -322,7 +632,7 @@ class CausalGraphTransformer(nn.Module):
     def _init_weights(self):
         """Initialize linear layer weights."""
         for module in [self.observable_proj, self.realized_proj, 
-                       self.combine_proj, self.edge_proj, self.output_head]:
+                       self.combine_proj, self.output_head]:
             for layer in module:
                 if isinstance(layer, nn.Linear):
                     nn.init.xavier_uniform_(layer.weight)
@@ -341,7 +651,6 @@ class CausalGraphTransformer(nn.Module):
         num_nodes = batch.size(0)
         positions = torch.zeros(num_nodes, dtype=torch.long, device=device)
         
-        # Get counts per graph using unique_consecutive (assumes sorted batch)
         _, counts = torch.unique_consecutive(batch, return_counts=True)
         
         offset = 0
@@ -358,21 +667,9 @@ class CausalGraphTransformer(nn.Module):
     ) -> Dict[int, torch.Tensor]:
         """
         Group edge indices by their source node's position.
-        
-        This is the KEY OPTIMIZATION: edges with same source position
-        share the same causal mask.
-        
-        Example:
-            Edge sources at positions: [0, 1, 0, 1, 2, 3, 0]
-            Returns: {
-                0: tensor([0, 2, 6]),  # edges with source at position 0
-                1: tensor([1, 3]),     # edges with source at position 1
-                2: tensor([4]),
-                3: tensor([5])
-            }
         """
         source_nodes = edge_index[0]
-        source_positions = positions[source_nodes]  # [E]
+        source_positions = positions[source_nodes]
         
         unique_positions = torch.unique(source_positions)
         
@@ -385,19 +682,23 @@ class CausalGraphTransformer(nn.Module):
     
     def _build_observable_features(self, data) -> torch.Tensor:
         """
-        Build observable features for all nodes.
+        Build observable features for all nodes using Time2Vec.
         
         Observable features are ALWAYS available (known before event happens):
-        - Continuous: time encodings, position, coordinates
+        - Time features: processed through Time2Vec
+        - Other continuous: is_delivery, position, has_plan
         - Categorical: event type, location, carrier, etc.
-        - Package: origin/destination, weight, etc.
+        - Package: origin/destination postal, weight, etc.
         """
         batch = data.batch
         
-        # 1. Continuous observable features [N, observable_dim]
-        node_observable = data.node_observable
+        # 1. Time features through Time2Vec [N, time2vec_dim]
+        time_emb = self.observable_time2vec(data.node_observable_time)
         
-        # 2. Categorical embeddings [N, cat_dim]
+        # 2. Other continuous features [N, observable_other_dim]
+        other_continuous = data.node_observable_other
+        
+        # 3. Categorical embeddings [N, cat_dim]
         node_cat_indices = {}
         for name in self.node_categorical_features:
             attr_name = f"{name}_idx"
@@ -406,27 +707,49 @@ class CausalGraphTransformer(nn.Module):
         
         node_cat_emb = self.node_embedding(node_cat_indices)
         
-        # 3. Package postal embeddings [N, 2*embed_dim]
-        # These are package-level, expanded to all nodes
-        source_postal_emb = self.postal_embedding(data.source_postal_idx)  # [G, embed]
-        dest_postal_emb = self.postal_embedding(data.dest_postal_idx)      # [G, embed]
+        # 4. Package postal embeddings [N, 2*embed_dim]
+        source_postal_emb = self.postal_embedding(data.source_postal_idx)
+        dest_postal_emb = self.postal_embedding(data.dest_postal_idx)
         package_postal_emb = torch.cat([
-            source_postal_emb[batch],  # [N, embed]
-            dest_postal_emb[batch]     # [N, embed]
+            source_postal_emb[batch],
+            dest_postal_emb[batch]
         ], dim=-1)
         
-        # 4. Package features [N, package_dim]
+        # 5. Package features [N, package_dim]
         package_features = data.package_features[batch]
         
         # Combine all observable features
         observable_combined = torch.cat([
-            node_observable,      # [N, obs_dim]
+            time_emb,             # [N, time2vec_dim]
+            other_continuous,     # [N, obs_other_dim]
             node_cat_emb,         # [N, cat_dim]
             package_postal_emb,   # [N, 2*embed]
             package_features      # [N, pkg_dim]
         ], dim=-1)
         
-        return self.observable_proj(observable_combined)  # [N, hidden_dim]
+        return self.observable_proj(observable_combined)
+    
+    def _build_realized_features(self, data) -> torch.Tensor:
+        """
+        Build realized features for all nodes using Time2Vec.
+        
+        Realized features (known AFTER event happens):
+        - Time features: actual event time processed through Time2Vec
+        - Other continuous: time_since_prev, dwelling, missort, problems
+        """
+        # 1. Time features through Time2Vec [N, time2vec_dim]
+        time_emb = self.realized_time2vec(data.node_realized_time)
+        
+        # 2. Other continuous features [N, realized_other_dim]
+        other_continuous = data.node_realized_other
+        
+        # Combine realized features
+        realized_combined = torch.cat([
+            time_emb,
+            other_continuous
+        ], dim=-1)
+        
+        return self.realized_proj(realized_combined)
     
     def _apply_causal_mask(
         self, 
@@ -441,66 +764,33 @@ class CausalGraphTransformer(nn.Module):
         For position P:
         - Nodes at position ≤ P: KEEP realized (events have happened)
         - Nodes at position > P: ZERO realized (future events)
-        
-        Args:
-            observable_hidden: [N, H] - always available
-            realized_hidden: [N, H] - to be masked
-            positions: [N] - position of each node
-            current_position: P - source position we're predicting from
         """
-        # Mask: True = keep realized, False = zero realized
-        causal_mask = (positions <= current_position)  # [N]
+        causal_mask = (positions <= current_position)
+        mask_expanded = causal_mask.unsqueeze(-1).float()
+        realized_masked = realized_hidden * mask_expanded
+        combined = torch.cat([observable_hidden, realized_masked], dim=-1)
         
-        # Expand mask for element-wise multiplication
-        mask_expanded = causal_mask.unsqueeze(-1).float()  # [N, 1]
-        
-        # Zero out future nodes' realized features
-        realized_masked = realized_hidden * mask_expanded  # [N, H]
-        
-        # Combine observable (always available) with masked realized
-        combined = torch.cat([observable_hidden, realized_masked], dim=-1)  # [N, 2H]
-        
-        return self.combine_proj(combined)  # [N, H]
+        return self.combine_proj(combined)
     
     def forward(self, data) -> torch.Tensor:
         """
-        Forward pass with causal masking - optimized by position.
-        
-        ════════════════════════════════════════════════════════════════════
-        ALGORITHM
-        ════════════════════════════════════════════════════════════════════
-        
-        1. PRECOMPUTE (once for batch):
-           - Observable features for all nodes
-           - Realized features for all nodes (before masking)
-           - Edge features
-           - Node positions
-           - Group edges by source position
-        
-        2. FOR EACH UNIQUE POSITION P (not each edge!):
-           a. Build causal mask: nodes ≤ P keep realized, others get zeros
-           b. Combine observable + masked realized
-           c. Run transformer layers
-           d. Predict for ALL edges with source at position P
-           e. Store predictions at original edge indices
-        
-        3. RETURN predictions aligned with data.edge_labels
-        
-        ════════════════════════════════════════════════════════════════════
+        Forward pass with causal masking and Time2Vec.
         
         Args:
             data: PyG Batch with:
-                - node_observable: [N, obs_dim]
-                - node_realized: [N, real_dim]
-                - edge_features: [E, edge_dim]
+                - node_observable_time: [N, 6] - time features for Time2Vec
+                - node_observable_other: [N, 3] - other observable features
+                - node_realized_time: [N, 6] - realized time features
+                - node_realized_other: [N, realized_other_dim] - other realized features
+                - edge_features: [E, 8]
                 - edge_index: [2, E]
                 - batch: [N]
-                - edge_labels: [E] - targets (for loss computation externally)
+                - edge_labels: [E] - targets
         
         Returns:
             predictions: [E, output_dim] - aligned with edge_labels by index
         """
-        device = data.node_observable.device
+        device = data.node_observable_time.device
         batch = data.batch
         edge_index = data.edge_index
         num_edges = edge_index.size(1)
@@ -513,25 +803,25 @@ class CausalGraphTransformer(nn.Module):
         # STEP 1: PRECOMPUTE (once for entire batch)
         # ════════════════════════════════════════════════════════════════
         
-        # Observable features - always available for all nodes
-        observable_hidden = self._build_observable_features(data)  # [N, H]
+        # Observable features with Time2Vec
+        observable_hidden = self._build_observable_features(data)
         
-        # Realized features - will be masked based on causal position
-        realized_hidden = self.realized_proj(data.node_realized)   # [N, H]
+        # Realized features with Time2Vec
+        realized_hidden = self._build_realized_features(data)
         
-        # Edge features
-        edge_hidden = self.edge_proj(data.edge_features)           # [E, H]
+        # Edge features with Time2Vec
+        edge_hidden = self.edge_time2vec(data.edge_features)
         
-        # Compute node positions within each graph
-        positions = self._compute_node_positions(batch)             # [N]
+        # Compute node positions
+        positions = self._compute_node_positions(batch)
         
-        # Group edges by source position (KEY OPTIMIZATION)
+        # Group edges by source position
         position_to_edges = self._group_edges_by_source_position(
             edge_index, positions
         )
         
         # ════════════════════════════════════════════════════════════════
-        # STEP 2: ALLOCATE OUTPUT (same order as edge_labels)
+        # STEP 2: ALLOCATE OUTPUT
         # ════════════════════════════════════════════════════════════════
         
         predictions = torch.zeros(num_edges, self.output_dim, device=device)
@@ -541,26 +831,20 @@ class CausalGraphTransformer(nn.Module):
         # ════════════════════════════════════════════════════════════════
         
         for pos in sorted(position_to_edges.keys()):
-            edge_indices = position_to_edges[pos]  # Tensor of edge indices
+            edge_indices = position_to_edges[pos]
             
-            # ────────────────────────────────────────────────────────────
-            # 3a. Apply causal mask for this position
-            # ────────────────────────────────────────────────────────────
+            # 3a. Apply causal mask
             node_hidden = self._apply_causal_mask(
                 observable_hidden, 
                 realized_hidden, 
                 positions, 
                 current_position=pos
-            )  # [N, H]
+            )
             
-            # ────────────────────────────────────────────────────────────
             # 3b. Add positional encoding
-            # ────────────────────────────────────────────────────────────
-            node_hidden = self.pos_encoding(node_hidden, positions)  # [N, H]
+            node_hidden = self.pos_encoding(node_hidden, positions)
             
-            # ────────────────────────────────────────────────────────────
             # 3c. Run transformer layers
-            # ────────────────────────────────────────────────────────────
             for layer in self.layers:
                 node_hidden = layer(
                     node_hidden, 
@@ -568,23 +852,18 @@ class CausalGraphTransformer(nn.Module):
                     edge_hidden if self.use_edge_features else None
                 )
             
-            # ────────────────────────────────────────────────────────────
             # 3d. Batch predict for ALL edges at this position
-            # ────────────────────────────────────────────────────────────
-            source_indices = edge_index[0, edge_indices]  # [num_edges_at_pos]
+            source_indices = edge_index[0, edge_indices]
+            source_hidden = node_hidden[source_indices]
+            edges_hidden = edge_hidden[edge_indices]
             
-            source_hidden = node_hidden[source_indices]   # [num_edges_at_pos, H]
-            edges_hidden = edge_hidden[edge_indices]      # [num_edges_at_pos, H]
+            combined = torch.cat([source_hidden, edges_hidden], dim=-1)
+            preds = self.output_head(combined)
             
-            combined = torch.cat([source_hidden, edges_hidden], dim=-1)  # [*, 2H]
-            preds = self.output_head(combined)                            # [*, output_dim]
-            
-            # ────────────────────────────────────────────────────────────
-            # 3e. Store at ORIGINAL indices (aligns with edge_labels)
-            # ────────────────────────────────────────────────────────────
+            # 3e. Store at original indices
             predictions[edge_indices] = preds
         
-        return predictions  # [E, output_dim] - aligned with data.edge_labels
+        return predictions
     
     def get_num_parameters(self) -> Dict[str, int]:
         """Count model parameters."""

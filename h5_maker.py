@@ -47,7 +47,6 @@ def prepare_data(config: Config):
     logger.info(f"\nLoading data: {config.data.source_data}")
     
     if config.data.source_data.startswith('s3://'):
-        # Load from S3
         import boto3
         import io
         path = config.data.source_data.replace('s3://', '')
@@ -91,12 +90,12 @@ def prepare_data(config: Config):
     del df
     gc.collect()
     
-    # Fit preprocessor
+    # Fit preprocessor - PASS CONFIG HERE
     logger.info("\n" + "=" * 70)
     logger.info("FITTING PREPROCESSOR")
     logger.info("=" * 70)
     
-    preprocessor = PackageLifecyclePreprocessor(distance_df=distance_df)
+    preprocessor = PackageLifecyclePreprocessor(config=config, distance_df=distance_df)
     preprocessor.fit(train_df)
     
     # Save preprocessor directly to S3
