@@ -7,88 +7,89 @@ from models.graph_transformer import GraphTransformerWithEmbeddings
 
 
 class EventTimePredictor(nn.Module):
-    """Complete model for predicting next event time with categorical embeddings"""
+    """Complete model for predicting next event time with ZERO feature leakage"""
     
-    def __init__(self, config: ModelConfig, vocab_sizes: Dict[str, int]):
+    def __init__(self, config: ModelConfig, vocab_sizes: Dict[str, int], 
+                 feature_dims: Dict = None):
         """
         Args:
             config: ModelConfig object with model architecture settings
             vocab_sizes: Dict mapping category name to vocabulary size
+            feature_dims: Dict with 'observable_dim', 'realized_dim', 'edge_dim', 'package_dim'
         """
         super().__init__()
         
         self.config = config
         self.vocab_sizes = vocab_sizes
+        self.feature_dims = feature_dims
         
         # Initialize Graph Transformer with embeddings
-        self.graph_transformer = GraphTransformerWithEmbeddings(config, vocab_sizes)
+        self.graph_transformer = GraphTransformerWithEmbeddings(
+            config, vocab_sizes, feature_dims
+        )
     
     def forward(self, data) -> torch.Tensor:
         """
-        Forward pass
+        Forward pass with zero feature leakage.
+        
+        For each edge (source → target):
+        - Nodes 0 to source: use observable + realized features
+        - Nodes source+1 to N-1: use observable + ZEROS (realized zeroed)
         
         Args:
             data: PyG Data batch from PackageLifecycleDataset
             
         Returns:
-            predictions: Predicted time to next event for each node [num_nodes, 1]
+            predictions: Predicted time to next event for each edge [num_edges, 1]
         """
         predictions = self.graph_transformer(data)
         return predictions
     
     @torch.no_grad()
-    def predict(self, data, return_all: bool = False) -> torch.Tensor:
+    def predict(self, data) -> torch.Tensor:
         """
-        Predict time to next event
+        Predict time to next event for all edges.
         
         Args:
             data: PyG Data batch
-            return_all: If True, return predictions for all nodes.
-                       If False, return only predictions for nodes with valid labels.
         
         Returns:
-            predictions: Predicted times [num_valid_nodes, 1] or [num_nodes, 1]
+            predictions: Predicted times [num_edges, 1]
         """
         self.eval()
-        
         predictions = self.forward(data)
-        
-        if return_all:
-            return predictions
-        else:
-            # Return only predictions for nodes with labels (exclude last node per graph)
-            if hasattr(data, 'label_mask'):
-                return predictions[data.label_mask]
-            else:
-                return self._exclude_last_nodes(predictions, data.batch)
+        return predictions
     
     @torch.no_grad()
     def predict_next_event(self, data) -> torch.Tensor:
         """
-        Predict time to next event for the last node in each graph.
+        Predict time to next event for the last edge in each graph.
         Useful for inference on partial lifecycles.
         
         Args:
             data: PyG Data batch
             
         Returns:
-            last_node_preds: Predictions for last node of each graph [batch_size, 1]
+            last_edge_preds: Predictions for last edge of each graph [batch_size, 1]
         """
         self.eval()
         
         predictions = self.forward(data)
         
-        # Get prediction for last node in each graph
-        batch_size = data.batch.max().item() + 1
-        last_node_preds = []
+        # Get prediction for last edge in each graph
+        edge_counts = data.edge_counts.tolist()
+        last_edge_preds = []
         
-        for i in range(batch_size):
-            mask = data.batch == i
-            graph_preds = predictions[mask]
-            last_pred = graph_preds[-1]  # Last node prediction
-            last_node_preds.append(last_pred)
+        edge_start = 0
+        for count in edge_counts:
+            if count > 0:
+                last_pred = predictions[edge_start + count - 1]
+                last_edge_preds.append(last_pred)
+            edge_start += count
         
-        return torch.stack(last_node_preds)
+        if last_edge_preds:
+            return torch.stack(last_edge_preds)
+        return torch.zeros((0, 1), device=predictions.device)
     
     @torch.no_grad()
     def predict_all_transitions(self, data) -> List[Dict]:
@@ -104,58 +105,30 @@ class EventTimePredictor(nn.Module):
         self.eval()
         
         predictions = self.forward(data)
-        batch_size = data.batch.max().item() + 1
+        
+        edge_counts = data.edge_counts.tolist()
+        node_counts = data.node_counts.tolist()
         
         results = []
+        edge_start = 0
         
-        for i in range(batch_size):
-            mask = data.batch == i
-            graph_preds = predictions[mask].cpu().numpy()
-            
-            # Get number of nodes in this graph
-            num_nodes = mask.sum().item()
-            
-            # All nodes except last have valid predictions
-            valid_preds = graph_preds[:-1] if num_nodes > 1 else graph_preds
+        for i, (n_edges, n_nodes) in enumerate(zip(edge_counts, node_counts)):
+            graph_preds = predictions[edge_start:edge_start + n_edges].cpu().numpy()
             
             results.append({
                 'graph_idx': i,
-                'num_events': num_nodes,
-                'predictions': valid_preds.flatten().tolist(),
-                'last_event_prediction': graph_preds[-1].flatten().tolist()
+                'num_events': n_nodes,
+                'num_transitions': n_edges,
+                'predictions': graph_preds.flatten().tolist(),
             })
+            
+            edge_start += n_edges
         
         return results
-    
-    def _exclude_last_nodes(self, preds: torch.Tensor, batch: torch.Tensor) -> torch.Tensor:
-        """
-        Exclude the last node from each graph in the batch.
-        
-        Args:
-            preds: Predictions for all nodes [num_nodes, ...]
-            batch: Batch indices indicating which graph each node belongs to
-        
-        Returns:
-            Predictions excluding last node of each graph
-        """
-        num_graphs = batch.max().item() + 1
-        mask = torch.ones(len(preds), dtype=torch.bool, device=preds.device)
-        
-        for graph_id in range(num_graphs):
-            node_indices = (batch == graph_id).nonzero(as_tuple=True)[0]
-            if len(node_indices) > 0:
-                last_node_idx = node_indices[-1]
-                mask[last_node_idx] = False
-        
-        return preds[mask]
     
     def get_num_parameters(self) -> Dict[str, int]:
         """Get number of parameters"""
         return self.graph_transformer.get_num_parameters()
-    
-    def get_embedding_weights(self) -> Dict[str, torch.Tensor]:
-        """Get embedding weights for analysis"""
-        return self.graph_transformer.get_embedding_weights()
     
     @classmethod
     def from_checkpoint(cls, checkpoint_path: str, device: torch.device = None) -> 'EventTimePredictor':
@@ -176,9 +149,10 @@ class EventTimePredictor(nn.Module):
         # Reconstruct config
         config = ModelConfig.from_dict(checkpoint['model_config'])
         vocab_sizes = checkpoint['vocab_sizes']
+        feature_dims = checkpoint.get('feature_dims', None)
         
         # Create model
-        model = cls(config, vocab_sizes)
+        model = cls(config, vocab_sizes, feature_dims)
         model.load_state_dict(checkpoint['model_state_dict'])
         model.to(device)
         model.eval()
@@ -205,8 +179,9 @@ class EventTimePredictor(nn.Module):
         """
         config = ModelConfig.from_preprocessor(preprocessor, **config_kwargs)
         vocab_sizes = preprocessor.get_vocab_sizes()
+        feature_dims = preprocessor.get_feature_dims()
         
-        model = cls(config, vocab_sizes)
+        model = cls(config, vocab_sizes, feature_dims)
         
         if device is not None:
             model.to(device)

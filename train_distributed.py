@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-train_distributed.py - Distributed training with S3 H5 cache
+train_distributed.py - Distributed training with S3 H5 cache (Zero Leakage)
 """
 
 import os
@@ -104,10 +104,10 @@ def parse_args():
     parser.add_argument('--data_file', type=str, default='source.json')
     
     # S3 Cache
-    parser.add_argument('--cache_dir', type=str, default="s3://graph-transformer-exp/cache000/",
+    parser.add_argument('--cache_dir', type=str, default="s3://graph-transformer-exp/package-lifecycle/cache/test/",
                         help='S3 path for H5 cache (e.g., s3://bucket/path/)')
-    parser.add_argument('--load_from_cache', type=bool, default=False)
-    parser.add_argument('--save_to_cache', type=bool, default=True)
+    parser.add_argument('--load_from_cache', type=bool, default=True)
+    parser.add_argument('--save_to_cache', type=bool, default=False)
     
     # Distributed
     parser.add_argument('--find_unused_parameters', action='store_true', default=False)
@@ -117,6 +117,8 @@ def parse_args():
     # AMP (autocast only, no grad scaling)
     parser.add_argument('--disable_amp', action='store_true', default=False,
                         help='Disable automatic mixed precision')
+    
+    # REMOVED: --forward_mode argument (no longer needed)
     
     return parser.parse_args()
 
@@ -297,79 +299,6 @@ def load_and_prepare_data(args, rank, local_rank, world_size, log):
         dist.broadcast(cache_tensor, src=0)
     cache_exists = cache_tensor.item() == 1
     
-    # Rank 0 creates cache if needed
-    #if rank == 0 and not (args.load_from_cache and cache_exists):
-    #    log.info("Creating H5 cache...")
-    #    os.makedirs(args.model_dir, exist_ok=True)
-        
-        # Load raw data
-    #    data_path = os.path.join(args.training, args.data_file)
-    #    log.info(f"  Loading: {data_path}")
-    #    df = pd.read_json(data_path)
-    #    log.info(f"  Samples: {len(df)}")
-        
-        # Distance matrix
-    #    distance_path = os.path.join(args.training, args.distance_file)
-    #    distance_df = pd.read_csv(distance_path) if os.path.exists(distance_path) else None
-        
-        # Split
-    #    df = df.sample(frac=1, random_state=args.seed).reset_index(drop=True)
-    #    train_size = int(args.train_ratio * len(df))
-    #    val_size = int(args.val_ratio * len(df))
-        
-    #    train_df = df.iloc[:train_size].reset_index(drop=True)
-    #    val_df = df.iloc[train_size:train_size + val_size].reset_index(drop=True)
-    #    test_df = df.iloc[train_size + val_size:].reset_index(drop=True)
-        
-    #    log.info(f"  Split: Train={len(train_df)}, Val={len(val_df)}, Test={len(test_df)}")
-    #    del df
-    #    gc.collect()
-        
-        # Preprocessor
-    #    config = Config()
-    #    preprocessor = PackageLifecyclePreprocessor(config=config, distance_df=distance_df)
-    #    preprocessor.fit(train_df)
-        
-    #    local_preprocessor = os.path.join(args.model_dir, 'preprocessor.pkl')
-    #    preprocessor.save(local_preprocessor)
-    #    s3_upload(local_preprocessor, preprocessor_cache, log.info)
-        
-    #    del distance_df
-    #    gc.collect()
-        
-        # Create datasets (saves to S3)
-    #    log.info("  Creating train.h5...")
-    #    PackageLifecycleDataset(
-    #        df=train_df, preprocessor=preprocessor,
-    #        h5_cache_path=train_cache,
-    #        load_from_cache=False, save_to_cache=True,
-    #        log_fn=log.info
-    #    )
-    #    del train_df
-    #    gc.collect()
-        
-    #    log.info("  Creating val.h5...")
-    #    PackageLifecycleDataset(
-    #        df=val_df, preprocessor=preprocessor,
-    #        h5_cache_path=val_cache,
-    #        load_from_cache=False, save_to_cache=True,
-    #        log_fn=log.info
-    #    )
-    #    del val_df
-    #    gc.collect()
-        
-    #    log.info("  Creating test.h5...")
-    #    PackageLifecycleDataset(
-    #        df=test_df, preprocessor=preprocessor,
-    #        h5_cache_path=test_cache,
-    #        load_from_cache=False, save_to_cache=True,
-    #        log_fn=log.info
-    #    )
-    #    del test_df
-    #    gc.collect()
-        
-    #    log.info("  ✓ Cache created")
-    
     # Wait for rank 0
     sync_barrier(device)
     
@@ -382,21 +311,21 @@ def load_and_prepare_data(args, rank, local_rank, world_size, log):
     train_dataset = PackageLifecycleDataset(
         h5_cache_path=train_cache,
         load_from_cache=True,
-        save_to_cache =False,
+        save_to_cache=False,
         log_fn=log_fn
     )
     
     val_dataset = PackageLifecycleDataset(
         h5_cache_path=val_cache,
         load_from_cache=True,
-        save_to_cache =False,
+        save_to_cache=False,
         log_fn=log_fn
     )
     
     test_dataset = PackageLifecycleDataset(
         h5_cache_path=test_cache,
         load_from_cache=True,
-        save_to_cache =False,
+        save_to_cache=False,
         log_fn=log_fn
     )
     
@@ -465,6 +394,7 @@ def create_model(preprocessor, args, device, local_rank, world_size, rank):
     
     log = get_logger(rank)
     vocab_sizes = preprocessor.get_vocab_sizes()
+    feature_dims = preprocessor.get_feature_dims()
     
     model_config = ModelConfig.from_preprocessor(
         preprocessor,
@@ -479,7 +409,7 @@ def create_model(preprocessor, args, device, local_rank, world_size, rank):
         use_positional_encoding=False
     )
     
-    model = EventTimePredictor(model_config, vocab_sizes).to(device)
+    model = EventTimePredictor(model_config, vocab_sizes, feature_dims).to(device)
     
     # Initialize weights for stability
     def init_weights(module):
@@ -498,7 +428,7 @@ def create_model(preprocessor, args, device, local_rank, world_size, rank):
                     gradient_as_bucket_view=True)
         log.info("Model wrapped with DDP")
     
-    return model, model_config, vocab_sizes
+    return model, model_config, vocab_sizes, feature_dims
 
 
 # =============================================================================
@@ -558,29 +488,40 @@ def diagnose_batch(model, batch, device, rank, use_amp=True):
         
         # Check input data
         logging.info("  [Diagnostic] Input checks:")
-        logging.info(f"    - Num nodes: {batch.num_nodes}")
+        logging.info(f"    - Num nodes: {batch.num_nodes if hasattr(batch, 'num_nodes') else 'N/A'}")
         logging.info(f"    - Num edges: {batch.edge_index.shape[1] if batch.edge_index is not None else 0}")
         
-        # Check for NaN/Inf in input features
-        if hasattr(batch, 'x') and batch.x is not None:
-            x_nan = torch.isnan(batch.x).any().item()
-            x_inf = torch.isinf(batch.x).any().item()
-            logging.info(f"    - Node features: shape={batch.x.shape}, has_nan={x_nan}, has_inf={x_inf}")
-            if x_nan or x_inf:
-                logging.warning("    ⚠ NaN/Inf detected in input features!")
+        # Check node_observable and node_realized
+        if hasattr(batch, 'node_observable') and batch.node_observable is not None:
+            obs_nan = torch.isnan(batch.node_observable).any().item()
+            obs_inf = torch.isinf(batch.node_observable).any().item()
+            logging.info(f"    - Node observable: shape={batch.node_observable.shape}, has_nan={obs_nan}, has_inf={obs_inf}")
+            if obs_nan or obs_inf:
+                logging.warning("    ⚠ NaN/Inf detected in node_observable!")
         
-        if hasattr(batch, 'edge_attr') and batch.edge_attr is not None:
-            e_nan = torch.isnan(batch.edge_attr).any().item()
-            e_inf = torch.isinf(batch.edge_attr).any().item()
-            logging.info(f"    - Edge features: shape={batch.edge_attr.shape}, has_nan={e_nan}, has_inf={e_inf}")
+        if hasattr(batch, 'node_realized') and batch.node_realized is not None:
+            real_nan = torch.isnan(batch.node_realized).any().item()
+            real_inf = torch.isinf(batch.node_realized).any().item()
+            logging.info(f"    - Node realized: shape={batch.node_realized.shape}, has_nan={real_nan}, has_inf={real_inf}")
+            if real_nan or real_inf:
+                logging.warning("    ⚠ NaN/Inf detected in node_realized!")
         
-        # Forward pass
+        if hasattr(batch, 'edge_features') and batch.edge_features is not None:
+            e_nan = torch.isnan(batch.edge_features).any().item()
+            e_inf = torch.isinf(batch.edge_features).any().item()
+            logging.info(f"    - Edge features: shape={batch.edge_features.shape}, has_nan={e_nan}, has_inf={e_inf}")
+        
+        # Check edge_labels
+        if hasattr(batch, 'edge_labels') and batch.edge_labels is not None:
+            logging.info(f"    - Edge labels: shape={batch.edge_labels.shape}")
+        
+        # Forward pass (no mode parameter)
         with torch.amp.autocast('cuda', enabled=use_amp):
             try:
                 preds = model(batch)
                 p_nan = torch.isnan(preds).any().item()
                 p_inf = torch.isinf(preds).any().item()
-                logging.info(f"  [Diagnostic] Predictions: min={preds.min():.4f}, max={preds.max():.4f}, "
+                logging.info(f"  [Diagnostic] Predictions: shape={preds.shape}, min={preds.min():.4f}, max={preds.max():.4f}, "
                            f"mean={preds.mean():.4f}, has_nan={p_nan}, has_inf={p_inf}")
                 
                 if p_nan or p_inf:
@@ -634,34 +575,40 @@ def train_epoch(model, loader, optimizer, criterion, device, preprocessor,
         with ctx:
             # Use autocast for forward pass (memory savings)
             with torch.amp.autocast('cuda', enabled=use_amp):
-                preds = model(batch)
-                mask = batch.label_mask
-                masked_preds = preds[mask].squeeze(-1) if preds[mask].dim() > 1 else preds[mask]
-                masked_targets = batch.labels.squeeze(-1) if batch.labels.dim() > 1 else batch.labels
+                preds = model(batch)  # No mode parameter
                 
-                if masked_preds.numel() == 0:
+                # Use edge_labels
+                edge_labels = batch.edge_labels
+                
+                # Squeeze predictions if needed
+                preds_flat = preds.squeeze(-1) if preds.dim() > 1 else preds
+                labels_flat = edge_labels.squeeze(-1) if edge_labels.dim() > 1 else edge_labels
+                
+                if preds_flat.numel() == 0:
                     skipped_batches += 1
                     continue
                 
-                min_len = min(len(masked_preds), len(masked_targets))
-                masked_preds, masked_targets = masked_preds[:min_len], masked_targets[:min_len]
+                # Ensure same length
+                min_len = min(len(preds_flat), len(labels_flat))
+                preds_flat = preds_flat[:min_len]
+                labels_flat = labels_flat[:min_len]
                 
                 # Check for NaN/Inf in predictions
-                if torch.isnan(masked_preds).any() or torch.isinf(masked_preds).any():
+                if torch.isnan(preds_flat).any() or torch.isinf(preds_flat).any():
                     skipped_due_to_invalid_loss += 1
                     if rank == 0 and skipped_due_to_invalid_loss <= 5:
                         log.warning(f"  Batch {batch_idx}: NaN/Inf in predictions, skipping")
                     continue
                 
                 # Check for NaN/Inf in targets
-                if torch.isnan(masked_targets).any() or torch.isinf(masked_targets).any():
+                if torch.isnan(labels_flat).any() or torch.isinf(labels_flat).any():
                     skipped_due_to_invalid_loss += 1
                     if rank == 0 and skipped_due_to_invalid_loss <= 5:
                         log.warning(f"  Batch {batch_idx}: NaN/Inf in targets, skipping")
                     continue
                 
                 # Compute loss in float32 for stability
-                loss = criterion(masked_preds.float(), masked_targets.float())
+                loss = criterion(preds_flat.float(), labels_flat.float())
                 
                 # Check for NaN/Inf in loss
                 if torch.isnan(loss) or torch.isinf(loss):
@@ -676,13 +623,13 @@ def train_epoch(model, loader, optimizer, criterion, device, preprocessor,
             scaled_loss.backward()
         
         valid_batches += 1
-        bs = masked_preds.size(0)
+        bs = preds_flat.size(0)
         accumulated_loss += loss.item() * bs
         accumulated_samples += bs
         
         # Store predictions for metrics
-        all_preds.append(preprocessor.inverse_transform_time(masked_preds.detach().float().cpu().numpy()))
-        all_targets.append(preprocessor.inverse_transform_time(masked_targets.float().cpu().numpy()))
+        all_preds.append(preprocessor.inverse_transform_time(preds_flat.detach().float().cpu().numpy()))
+        all_targets.append(preprocessor.inverse_transform_time(labels_flat.float().cpu().numpy()))
         
         if should_sync:
             # Compute gradient norm and clip
@@ -742,35 +689,38 @@ def validate(model, loader, criterion, device, preprocessor, use_amp=True):
         batch = batch.to(device, non_blocking=True)
         
         with torch.amp.autocast('cuda', enabled=use_amp):
-            preds = model(batch)
+            preds = model(batch)  # No mode parameter
         
-        mask = batch.label_mask
+        # Use edge_labels
+        edge_labels = batch.edge_labels
         
-        masked_preds = preds[mask].squeeze(-1) if preds[mask].dim() > 1 else preds[mask]
-        masked_targets = batch.labels.squeeze(-1) if batch.labels.dim() > 1 else batch.labels
+        # Squeeze predictions if needed
+        preds_flat = preds.squeeze(-1) if preds.dim() > 1 else preds
+        labels_flat = edge_labels.squeeze(-1) if edge_labels.dim() > 1 else edge_labels
         
-        if masked_preds.numel() == 0:
+        if preds_flat.numel() == 0:
             continue
         
-        min_len = min(len(masked_preds), len(masked_targets))
-        masked_preds, masked_targets = masked_preds[:min_len], masked_targets[:min_len]
+        min_len = min(len(preds_flat), len(labels_flat))
+        preds_flat = preds_flat[:min_len]
+        labels_flat = labels_flat[:min_len]
         
         # Skip batches with NaN/Inf
-        if torch.isnan(masked_preds).any() or torch.isinf(masked_preds).any():
+        if torch.isnan(preds_flat).any() or torch.isinf(preds_flat).any():
             continue
         
         # Compute loss in float32
-        loss = criterion(masked_preds.float(), masked_targets.float())
+        loss = criterion(preds_flat.float(), labels_flat.float())
         
         if torch.isnan(loss) or torch.isinf(loss):
             continue
         
-        bs = masked_preds.size(0)
+        bs = preds_flat.size(0)
         total_loss += loss.item() * bs
         total_samples += bs
         
-        all_preds.append(preprocessor.inverse_transform_time(masked_preds.float().cpu().numpy()))
-        all_targets.append(preprocessor.inverse_transform_time(masked_targets.float().cpu().numpy()))
+        all_preds.append(preprocessor.inverse_transform_time(preds_flat.float().cpu().numpy()))
+        all_targets.append(preprocessor.inverse_transform_time(labels_flat.float().cpu().numpy()))
     
     if total_samples == 0:
         return {'loss': float('inf'), 'mae': float('inf'), 'rmse': float('inf'), 'mape': 0.0, 'r2': 0.0}
@@ -781,7 +731,7 @@ def validate(model, loader, criterion, device, preprocessor, use_amp=True):
 
 
 def save_checkpoint(model, optimizer, scheduler, epoch, metrics,
-                    model_config, vocab_sizes, save_path, is_best=False):
+                    model_config, vocab_sizes, feature_dims, save_path, is_best=False):
     model_to_save = model.module if hasattr(model, 'module') else model
     checkpoint = {
         'epoch': epoch,
@@ -790,6 +740,7 @@ def save_checkpoint(model, optimizer, scheduler, epoch, metrics,
         'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
         'model_config': model_config.to_dict(),
         'vocab_sizes': vocab_sizes,
+        'feature_dims': feature_dims,
         'metrics': metrics,
         'is_best': is_best
     }
@@ -815,7 +766,7 @@ def main():
     use_amp = not args.disable_amp
     
     log.info("=" * 60)
-    log.info("DISTRIBUTED TRAINING")
+    log.info("DISTRIBUTED TRAINING (Zero Leakage)")
     log.info("=" * 60)
     log.info(f"  World size: {world_size}, Rank: {rank}, Device: {device}")
     log.info(f"  S3 cache: {args.cache_dir}")
@@ -834,7 +785,7 @@ def main():
             train_ds, val_ds, test_ds, args, rank, world_size
         )
         
-        model, model_config, vocab_sizes = create_model(
+        model, model_config, vocab_sizes, feature_dims = create_model(
             preprocessor, args, device, local_rank, world_size, rank
         )
         
@@ -860,20 +811,17 @@ def main():
         # Learning rate scheduler with warmup
         warmup_epochs = args.warmup_epochs
         if warmup_epochs > 0:
-            # Warmup scheduler: start from 1% of LR and increase to 100%
             warmup_scheduler = LinearLR(
                 optimizer,
                 start_factor=0.01,
                 end_factor=1.0,
                 total_iters=warmup_epochs
             )
-            # Main scheduler after warmup
             main_scheduler = CosineAnnealingLR(
                 optimizer,
                 T_max=args.epochs - warmup_epochs,
                 eta_min=args.learning_rate * 0.01
             )
-            # Combined scheduler
             scheduler = SequentialLR(
                 optimizer,
                 schedulers=[warmup_scheduler, main_scheduler],
@@ -906,7 +854,7 @@ def main():
             if train_sampler:
                 train_sampler.set_epoch(epoch)
             
-            # Training
+            # Training (no forward_mode)
             train_metrics = train_epoch(
                 model, train_loader, optimizer, criterion, device, preprocessor,
                 args.gradient_accumulation_steps, rank, world_size,
@@ -914,8 +862,10 @@ def main():
             )
             sync_barrier(device)
             
-            # Validation
-            val_metrics = validate(model, val_loader, criterion, device, preprocessor, use_amp=use_amp)
+            # Validation (no forward_mode)
+            val_metrics = validate(
+                model, val_loader, criterion, device, preprocessor, use_amp=use_amp
+            )
             
             # Track optimizer steps
             epoch_optimizer_steps = train_metrics.get('num_optimizer_steps', 0)
@@ -935,7 +885,6 @@ def main():
                 train_metrics_reduced = reduce_metrics(train_metrics_to_reduce, device, world_size)
                 val_metrics = reduce_metrics(val_metrics_to_reduce, device, world_size)
                 
-                # Keep original counts (sum them across workers)
                 for key in ['num_optimizer_steps', 'valid_batches', 'skipped_batches', 
                            'skipped_steps_due_to_nan', 'skipped_due_to_invalid_loss']:
                     if key in train_metrics:
@@ -980,7 +929,7 @@ def main():
                     save_checkpoint(
                         model, optimizer, scheduler, epoch,
                         {'val_loss': val_loss, 'val_mae': val_mae, 'val_r2': val_metrics['r2']},
-                        model_config, vocab_sizes,
+                        model_config, vocab_sizes, feature_dims,
                         os.path.join(args.model_dir, 'best_model.pt'), is_best=True
                     )
                     log.info(f"  ✓ New best model! (MAE: {best_val_mae:.2f}h)")
@@ -990,7 +939,7 @@ def main():
                     save_checkpoint(
                         model, optimizer, scheduler, epoch,
                         {'val_loss': val_loss, 'val_mae': val_mae},
-                        model_config, vocab_sizes,
+                        model_config, vocab_sizes, feature_dims,
                         os.path.join(args.model_dir, f'checkpoint_epoch_{epoch}.pt')
                     )
             
@@ -1021,7 +970,9 @@ def main():
                 m = model.module if hasattr(model, 'module') else model
                 m.load_state_dict(ckpt['model_state_dict'])
                 
-                test_metrics = validate(model, test_loader, criterion, device, preprocessor, use_amp=use_amp)
+                test_metrics = validate(
+                    model, test_loader, criterion, device, preprocessor, use_amp=use_amp
+                )
                 
                 log.info(f"Test: MAE={test_metrics['mae']:.2f}h, RMSE={test_metrics['rmse']:.2f}h, R²={test_metrics['r2']:.4f}")
                 
