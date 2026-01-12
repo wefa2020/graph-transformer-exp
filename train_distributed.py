@@ -1,22 +1,19 @@
 #!/usr/bin/env python3
 """
-train_distributed.py - Distributed training with S3 H5 cache (Zero Leakage)
+train_distributed.py - Distributed training for Causal Graph Transformer
 """
 
 import os
 import sys
 import json
-import argparse
 import signal
 import gc
 import time
 from datetime import timedelta
 from contextlib import nullcontext
 import logging
-from pathlib import Path
 
 import numpy as np
-import pandas as pd
 import torch
 import torch.nn as nn
 import torch.distributed as dist
@@ -25,6 +22,8 @@ from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
+
+from config import Config
 
 
 # =============================================================================
@@ -53,10 +52,6 @@ class RankLogger:
     
     def error(self, msg):
         self._logger.error(f"[Rank {self.rank}] {msg}")
-    
-    def debug(self, msg):
-        if self.rank == 0:
-            self._logger.debug(msg)
 
 
 def get_logger(rank: int) -> RankLogger:
@@ -64,63 +59,48 @@ def get_logger(rank: int) -> RankLogger:
 
 
 # =============================================================================
-# ARGUMENTS
+# S3 UTILITIES
 # =============================================================================
 
-def parse_args():
-    parser = argparse.ArgumentParser()
+def upload_to_s3(local_path: str, s3_path: str, log: RankLogger = None):
+    """Upload a file to S3."""
+    import boto3
+    from botocore.exceptions import ClientError
     
-    # Training
-    parser.add_argument('--epochs', type=int, default=200)
-    parser.add_argument('--batch_size', type=int, default=64)
-    parser.add_argument('--learning_rate', type=float, default=1e-4)
-    parser.add_argument('--weight_decay', type=float, default=0.01)
-    parser.add_argument('--seed', type=int, default=42)
-    parser.add_argument('--patience', type=int, default=15)
-    parser.add_argument('--min_delta', type=float, default=1e-4)
-    parser.add_argument('--gradient_accumulation_steps', type=int, default=1)
-    parser.add_argument('--warmup_epochs', type=int, default=5)
-    parser.add_argument('--max_grad_norm', type=float, default=1.0)
+    try:
+        s3_path_clean = s3_path.replace('s3://', '')
+        bucket, key = s3_path_clean.split('/', 1)
+        
+        boto3.client('s3').upload_file(local_path, bucket, key)
+        
+        if log:
+            log.info(f"Uploaded {local_path} to {s3_path}")
+        return True
+    except ClientError as e:
+        if log:
+            log.error(f"Failed to upload {local_path} to {s3_path}: {e}")
+        return False
+
+
+def upload_dict_to_s3(data: dict, s3_path: str, log: RankLogger = None):
+    """Upload a dict as JSON to S3."""
+    import boto3
+    from botocore.exceptions import ClientError
     
-    # Model
-    parser.add_argument('--hidden_dim', type=int, default=256)
-    parser.add_argument('--num_layers', type=int, default=40)
-    parser.add_argument('--num_heads', type=int, default=8)
-    parser.add_argument('--dropout', type=float, default=0.1)
-    parser.add_argument('--embed_dim', type=int, default=32)
-    
-    # Data
-    parser.add_argument('--train_ratio', type=float, default=0.9)
-    parser.add_argument('--val_ratio', type=float, default=0.05)
-    
-    # Paths
-    parser.add_argument('--model_dir', type=str,
-                        default=os.environ.get('SM_MODEL_DIR', '/opt/ml/model'))
-    parser.add_argument('--output_dir', type=str,
-                        default=os.environ.get('SM_OUTPUT_DIR', '/opt/ml/output'))
-    parser.add_argument('--training', type=str,
-                        default=os.environ.get('SM_CHANNEL_TRAINING', '/opt/ml/input/data/training'))
-    parser.add_argument('--distance_file', type=str, default='location_distances_complete.csv')
-    parser.add_argument('--data_file', type=str, default='source.json')
-    
-    # S3 Cache
-    parser.add_argument('--cache_dir', type=str, default="s3://graph-transformer-exp/package-lifecycle/cache/test/",
-                        help='S3 path for H5 cache (e.g., s3://bucket/path/)')
-    parser.add_argument('--load_from_cache', type=bool, default=True)
-    parser.add_argument('--save_to_cache', type=bool, default=False)
-    
-    # Distributed
-    parser.add_argument('--find_unused_parameters', action='store_true', default=False)
-    parser.add_argument('--checkpoint_frequency', type=int, default=5)
-    parser.add_argument('--num_workers', type=int, default=8)
-    
-    # AMP (autocast only, no grad scaling)
-    parser.add_argument('--disable_amp', action='store_true', default=False,
-                        help='Disable automatic mixed precision')
-    
-    # REMOVED: --forward_mode argument (no longer needed)
-    
-    return parser.parse_args()
+    try:
+        s3_path_clean = s3_path.replace('s3://', '')
+        bucket, key = s3_path_clean.split('/', 1)
+        
+        json_bytes = json.dumps(data, indent=2).encode('utf-8')
+        boto3.client('s3').put_object(Bucket=bucket, Key=key, Body=json_bytes)
+        
+        if log:
+            log.info(f"Uploaded JSON to {s3_path}")
+        return True
+    except ClientError as e:
+        if log:
+            log.error(f"Failed to upload to {s3_path}: {e}")
+        return False
 
 
 # =============================================================================
@@ -224,117 +204,57 @@ class EarlyStopping:
 
 
 # =============================================================================
-# S3 UTILITIES
-# =============================================================================
-
-def s3_exists(s3_path: str) -> bool:
-    """Check if S3 object exists."""
-    import boto3
-    from botocore.exceptions import ClientError
-    
-    path = s3_path.replace('s3://', '')
-    bucket = path.split('/')[0]
-    key = '/'.join(path.split('/')[1:])
-    
-    try:
-        boto3.client('s3').head_object(Bucket=bucket, Key=key)
-        return True
-    except ClientError:
-        return False
-
-
-def s3_upload(local_path: str, s3_path: str, log_fn=None):
-    """Upload file to S3."""
-    import boto3
-    
-    path = s3_path.replace('s3://', '')
-    bucket = path.split('/')[0]
-    key = '/'.join(path.split('/')[1:])
-    
-    if log_fn:
-        log_fn(f"  Uploading {local_path} -> s3://{bucket}/{key}")
-    
-    boto3.client('s3').upload_file(local_path, bucket, key)
-
-
-# =============================================================================
 # DATA LOADING
 # =============================================================================
 
-def load_and_prepare_data(args, rank, local_rank, world_size, log):
-    """Load data with S3 H5 cache."""
+def load_data(config: Config, rank: int, local_rank: int, world_size: int, log: RankLogger):
+    """Load datasets and preprocessor from S3."""
+    import boto3
     from data.data_preprocessor import PackageLifecyclePreprocessor
     from data.dataset import PackageLifecycleDataset
-    from config import Config
     
     device = torch.device(f'cuda:{local_rank}')
     
-    # S3 paths
-    cache_dir = args.cache_dir.rstrip('/')
-    train_cache = f"{cache_dir}/train.h5"
-    val_cache = f"{cache_dir}/val.h5"
-    test_cache = f"{cache_dir}/test.h5"
-    preprocessor_cache = f"{cache_dir}/preprocessor.pkl"
-    
     if rank == 0:
         log.info("=" * 60)
-        log.info("PREPARING DATA")
+        log.info("LOADING DATA")
         log.info("=" * 60)
-        log.info(f"  S3 cache dir: {cache_dir}")
+        log.info(f"  Train: {config.data.train_h5}")
+        log.info(f"  Val:   {config.data.val_h5}")
+        log.info(f"  Test:  {config.data.test_h5}")
     
-    # Check if cache exists
-    cache_exists = False
-    if rank == 0:
-        cache_exists = all([
-            s3_exists(train_cache),
-            s3_exists(val_cache),
-            s3_exists(test_cache),
-            s3_exists(preprocessor_cache)
-        ])
-        log.info(f"  Cache exists: {cache_exists}")
-    
-    # Broadcast cache_exists
-    cache_tensor = torch.tensor([1 if cache_exists else 0], device=device)
-    if world_size > 1:
-        dist.broadcast(cache_tensor, src=0)
-    cache_exists = cache_tensor.item() == 1
-    
-    # Wait for rank 0
     sync_barrier(device)
     
-    if rank == 0:
-        log.info("Loading datasets from S3 cache...")
-    
-    # All ranks load from S3 (dataset handles download)
     log_fn = log.info if rank == 0 else None
     
     train_dataset = PackageLifecycleDataset(
-        h5_cache_path=train_cache,
+        h5_cache_path=config.data.train_h5,
         load_from_cache=True,
         save_to_cache=False,
         log_fn=log_fn
     )
     
     val_dataset = PackageLifecycleDataset(
-        h5_cache_path=val_cache,
+        h5_cache_path=config.data.val_h5,
         load_from_cache=True,
         save_to_cache=False,
         log_fn=log_fn
     )
     
     test_dataset = PackageLifecycleDataset(
-        h5_cache_path=test_cache,
+        h5_cache_path=config.data.test_h5,
         load_from_cache=True,
         save_to_cache=False,
         log_fn=log_fn
     )
     
     # Load preprocessor
-    local_preprocessor = os.path.join(args.model_dir, 'preprocessor.pkl')
+    model_dir = os.environ.get('SM_MODEL_DIR', '/opt/ml/model')
+    local_preprocessor = os.path.join(model_dir, 'preprocessor.pkl')
+    
     if not os.path.exists(local_preprocessor):
-        import boto3
-        path = preprocessor_cache.replace('s3://', '')
-        bucket, key = path.split('/')[0], '/'.join(path.split('/')[1:])
+        s3_path = config.data.preprocessor_path.replace('s3://', '')
+        bucket, key = s3_path.split('/', 1)
         os.makedirs(os.path.dirname(local_preprocessor), exist_ok=True)
         boto3.client('s3').download_file(bucket, key, local_preprocessor)
     
@@ -343,40 +263,42 @@ def load_and_prepare_data(args, rank, local_rank, world_size, log):
     sync_barrier(device)
     
     if rank == 0:
-        log.info(f"  Train: {len(train_dataset)}, Val: {len(val_dataset)}, Test: {len(test_dataset)}")
+        log.info(f"  Loaded: Train={len(train_dataset)}, Val={len(val_dataset)}, Test={len(test_dataset)}")
         log.info("=" * 60)
     
     return train_dataset, val_dataset, test_dataset, preprocessor
 
 
-def create_dataloaders(train_dataset, val_dataset, test_dataset, args, rank, world_size):
+def create_dataloaders(train_dataset, val_dataset, test_dataset, config: Config, rank: int, world_size: int):
     log = get_logger(rank)
+    batch_size = config.training.batch_size
+    num_workers = config.data.num_workers
     
     train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True) if world_size > 1 else None
     val_sampler = DistributedSampler(val_dataset, num_replicas=world_size, rank=rank, shuffle=False) if world_size > 1 else None
     test_sampler = DistributedSampler(test_dataset, num_replicas=world_size, rank=rank, shuffle=False) if world_size > 1 else None
     
     train_loader = DataLoader(
-        train_dataset, batch_size=args.batch_size, sampler=train_sampler,
+        train_dataset, batch_size=batch_size, sampler=train_sampler,
         shuffle=(train_sampler is None), drop_last=True,
         collate_fn=train_dataset.get_collate_fn(),
-        num_workers=args.num_workers, pin_memory=True,
-        persistent_workers=args.num_workers > 0,
-        prefetch_factor=2 if args.num_workers > 0 else None,
+        num_workers=num_workers, pin_memory=True,
+        persistent_workers=num_workers > 0,
+        prefetch_factor=2 if num_workers > 0 else None,
     )
     
     val_loader = DataLoader(
-        val_dataset, batch_size=args.batch_size, sampler=val_sampler,
+        val_dataset, batch_size=batch_size, sampler=val_sampler,
         shuffle=False, drop_last=False,
         collate_fn=val_dataset.get_collate_fn(),
-        num_workers=args.num_workers, pin_memory=True,
+        num_workers=num_workers, pin_memory=True,
     )
     
     test_loader = DataLoader(
-        test_dataset, batch_size=args.batch_size, sampler=test_sampler,
+        test_dataset, batch_size=batch_size, sampler=test_sampler,
         shuffle=False, drop_last=False,
         collate_fn=test_dataset.get_collate_fn(),
-        num_workers=args.num_workers, pin_memory=True,
+        num_workers=num_workers, pin_memory=True,
     )
     
     log.info(f"DataLoaders: Train={len(train_loader)}, Val={len(val_loader)}, Test={len(test_loader)}")
@@ -388,47 +310,34 @@ def create_dataloaders(train_dataset, val_dataset, test_dataset, args, rank, wor
 # MODEL
 # =============================================================================
 
-def create_model(preprocessor, args, device, local_rank, world_size, rank):
-    from config import ModelConfig
+def create_model(preprocessor, config: Config, device, local_rank: int, world_size: int, rank: int):
+    """Create the Causal Graph Transformer model."""
     from models.event_predictor import EventTimePredictor
     
     log = get_logger(rank)
     vocab_sizes = preprocessor.get_vocab_sizes()
-    feature_dims = preprocessor.get_feature_dims()
+    feature_dims = preprocessor.get_feature_dimensions()
     
-    model_config = ModelConfig.from_preprocessor(
-        preprocessor,
-        hidden_dim=args.hidden_dim,
-        num_layers=args.num_layers,
-        num_heads=args.num_heads,
-        dropout=args.dropout,
-        embed_dim=args.embed_dim,
-        output_dim=1,
-        use_edge_features=True,
-        use_global_attention=False,
-        use_positional_encoding=False
+    if rank == 0:
+        log.info(f"Feature dims: {feature_dims}")
+        log.info(f"Vocab sizes: {vocab_sizes}")
+    
+    model = EventTimePredictor.from_config(
+        config=config,
+        vocab_sizes=vocab_sizes,
+        feature_dims=feature_dims,
+        device=device,
     )
     
-    model = EventTimePredictor(model_config, vocab_sizes, feature_dims).to(device)
-    
-    # Initialize weights for stability
-    def init_weights(module):
-        if isinstance(module, nn.Linear):
-            nn.init.xavier_uniform_(module.weight, gain=0.1)
-            if module.bias is not None:
-                nn.init.zeros_(module.bias)
-        elif isinstance(module, nn.Embedding):
-            nn.init.normal_(module.weight, mean=0, std=0.02)
-    
-    model.apply(init_weights)
-    
     if world_size > 1:
-        model = DDP(model, device_ids=[local_rank], output_device=local_rank,
-                    find_unused_parameters=args.find_unused_parameters,
-                    gradient_as_bucket_view=True)
+        model = DDP(
+            model, device_ids=[local_rank], output_device=local_rank,
+            find_unused_parameters=config.distributed.find_unused_parameters,
+            gradient_as_bucket_view=True
+        )
         log.info("Model wrapped with DDP")
     
-    return model, model_config, vocab_sizes, feature_dims
+    return model, vocab_sizes, feature_dims
 
 
 # =============================================================================
@@ -436,6 +345,7 @@ def create_model(preprocessor, args, device, local_rank, world_size, rank):
 # =============================================================================
 
 def compute_metrics(preds, targets):
+    """Compute regression metrics."""
     preds = np.asarray(preds).flatten()
     targets = np.asarray(targets).flatten()
     
@@ -456,15 +366,12 @@ def compute_metrics(preds, targets):
 
 
 def reduce_metrics(metrics, device, world_size):
+    """Reduce metrics across distributed workers."""
     if world_size <= 1:
         return metrics
     reduced = {}
     for k, v in metrics.items():
-        if isinstance(v, bool):
-            t = torch.tensor([1.0 if v else 0.0], device=device, dtype=torch.float32)
-            dist.all_reduce(t, op=dist.ReduceOp.SUM)
-            reduced[k] = t.item() > 0
-        elif isinstance(v, (int, float)):
+        if isinstance(v, (int, float)):
             t = torch.tensor(float(v), device=device, dtype=torch.float32)
             dist.all_reduce(t, op=dist.ReduceOp.SUM)
             reduced[k] = t.item() / world_size
@@ -474,94 +381,63 @@ def reduce_metrics(metrics, device, world_size):
 
 
 # =============================================================================
+# CHECKPOINTING WITH S3 UPLOAD
+# =============================================================================
+
+def save_checkpoint(
+    model, optimizer, scheduler, epoch, metrics, 
+    vocab_sizes, feature_dims, config: Config, 
+    local_path: str, s3_path: str = None,
+    is_best: bool = False, log: RankLogger = None
+):
+    """Save checkpoint locally and optionally upload to S3."""
+    model_to_save = model.module if hasattr(model, 'module') else model
+    
+    checkpoint = {
+        'epoch': epoch,
+        'model_state_dict': model_to_save.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
+        'vocab_sizes': vocab_sizes,
+        'feature_dims': feature_dims,
+        'model_config': model_to_save.get_config_dict(),
+        'config': config.to_dict(),
+        'metrics': metrics,
+        'is_best': is_best
+    }
+    
+    # Save locally
+    temp_path = local_path + '.tmp'
+    torch.save(checkpoint, temp_path)
+    os.replace(temp_path, local_path)
+    
+    # Upload to S3 if path provided
+    if s3_path:
+        upload_to_s3(local_path, s3_path, log)
+
+
+# =============================================================================
 # TRAINING
 # =============================================================================
 
-def diagnose_batch(model, batch, device, rank, use_amp=True):
-    """Run diagnostic on a single batch to check for numerical issues."""
-    if rank != 0:
-        return
-    
-    model.eval()
-    with torch.no_grad():
-        batch = batch.to(device, non_blocking=True)
-        
-        # Check input data
-        logging.info("  [Diagnostic] Input checks:")
-        logging.info(f"    - Num nodes: {batch.num_nodes if hasattr(batch, 'num_nodes') else 'N/A'}")
-        logging.info(f"    - Num edges: {batch.edge_index.shape[1] if batch.edge_index is not None else 0}")
-        
-        # Check node_observable and node_realized
-        if hasattr(batch, 'node_observable') and batch.node_observable is not None:
-            obs_nan = torch.isnan(batch.node_observable).any().item()
-            obs_inf = torch.isinf(batch.node_observable).any().item()
-            logging.info(f"    - Node observable: shape={batch.node_observable.shape}, has_nan={obs_nan}, has_inf={obs_inf}")
-            if obs_nan or obs_inf:
-                logging.warning("    ⚠ NaN/Inf detected in node_observable!")
-        
-        if hasattr(batch, 'node_realized') and batch.node_realized is not None:
-            real_nan = torch.isnan(batch.node_realized).any().item()
-            real_inf = torch.isinf(batch.node_realized).any().item()
-            logging.info(f"    - Node realized: shape={batch.node_realized.shape}, has_nan={real_nan}, has_inf={real_inf}")
-            if real_nan or real_inf:
-                logging.warning("    ⚠ NaN/Inf detected in node_realized!")
-        
-        if hasattr(batch, 'edge_features') and batch.edge_features is not None:
-            e_nan = torch.isnan(batch.edge_features).any().item()
-            e_inf = torch.isinf(batch.edge_features).any().item()
-            logging.info(f"    - Edge features: shape={batch.edge_features.shape}, has_nan={e_nan}, has_inf={e_inf}")
-        
-        # Check edge_labels
-        if hasattr(batch, 'edge_labels') and batch.edge_labels is not None:
-            logging.info(f"    - Edge labels: shape={batch.edge_labels.shape}")
-        
-        # Forward pass (no mode parameter)
-        with torch.amp.autocast('cuda', enabled=use_amp):
-            try:
-                preds = model(batch)
-                p_nan = torch.isnan(preds).any().item()
-                p_inf = torch.isinf(preds).any().item()
-                logging.info(f"  [Diagnostic] Predictions: shape={preds.shape}, min={preds.min():.4f}, max={preds.max():.4f}, "
-                           f"mean={preds.mean():.4f}, has_nan={p_nan}, has_inf={p_inf}")
-                
-                if p_nan or p_inf:
-                    logging.warning("  ⚠ NaN/Inf detected in predictions!")
-                    
-            except Exception as e:
-                logging.error(f"  [Diagnostic] Forward pass failed: {e}")
-    
-    model.train()
-
-
-def train_epoch(model, loader, optimizer, criterion, device, preprocessor,
-                grad_accum=1, rank=0, world_size=1, max_grad_norm=1.0,
-                epoch=1, use_amp=True):
+def train_epoch(model, loader, optimizer, criterion, device, preprocessor, config: Config,
+                rank: int, world_size: int, epoch: int):
+    """Train for one epoch."""
     model.train()
     total_loss, total_samples = 0.0, 0
     all_preds, all_targets = [], []
     num_optimizer_steps = 0
-    valid_batches = 0
     skipped_batches = 0
-    skipped_steps_due_to_nan = 0
-    skipped_due_to_invalid_loss = 0
+    
+    grad_accum = config.training.gradient_accumulation_steps
+    max_grad_norm = config.training.max_grad_norm
+    use_amp = config.training.use_amp
     
     is_ddp = world_size > 1 and hasattr(model, 'no_sync')
     num_batches = len(loader)
     
-    log = get_logger(rank)
-    
     if num_batches == 0:
-        return {
-            'loss': 0.0, 'mae': 0.0, 'rmse': 0.0, 'mape': 0.0, 'r2': 0.0,
-            'num_optimizer_steps': 0, 'valid_batches': 0, 'skipped_batches': 0,
-            'skipped_steps_due_to_nan': 0, 'skipped_due_to_invalid_loss': 0
-        }
-    
-    # Run diagnostic on first batch of first epoch
-    if epoch == 1 and rank == 0:
-        for batch in loader:
-            diagnose_batch(model, batch, device, rank, use_amp)
-            break
+        return {'loss': 0.0, 'mae': 0.0, 'rmse': 0.0, 'mape': 0.0, 'r2': 0.0, 'num_optimizer_steps': 0}
     
     optimizer.zero_grad()
     accumulated_loss = 0.0
@@ -573,14 +449,10 @@ def train_epoch(model, loader, optimizer, criterion, device, preprocessor,
         ctx = model.no_sync() if (is_ddp and not should_sync) else nullcontext()
         
         with ctx:
-            # Use autocast for forward pass (memory savings)
             with torch.amp.autocast('cuda', enabled=use_amp):
-                preds = model(batch)  # No mode parameter
-                
-                # Use edge_labels
+                preds = model(batch)
                 edge_labels = batch.edge_labels
                 
-                # Squeeze predictions if needed
                 preds_flat = preds.squeeze(-1) if preds.dim() > 1 else preds
                 labels_flat = edge_labels.squeeze(-1) if edge_labels.dim() > 1 else edge_labels
                 
@@ -588,99 +460,60 @@ def train_epoch(model, loader, optimizer, criterion, device, preprocessor,
                     skipped_batches += 1
                     continue
                 
-                # Ensure same length
                 min_len = min(len(preds_flat), len(labels_flat))
-                preds_flat = preds_flat[:min_len]
-                labels_flat = labels_flat[:min_len]
+                preds_flat, labels_flat = preds_flat[:min_len], labels_flat[:min_len]
                 
-                # Check for NaN/Inf in predictions
                 if torch.isnan(preds_flat).any() or torch.isinf(preds_flat).any():
-                    skipped_due_to_invalid_loss += 1
-                    if rank == 0 and skipped_due_to_invalid_loss <= 5:
-                        log.warning(f"  Batch {batch_idx}: NaN/Inf in predictions, skipping")
+                    skipped_batches += 1
                     continue
                 
-                # Check for NaN/Inf in targets
-                if torch.isnan(labels_flat).any() or torch.isinf(labels_flat).any():
-                    skipped_due_to_invalid_loss += 1
-                    if rank == 0 and skipped_due_to_invalid_loss <= 5:
-                        log.warning(f"  Batch {batch_idx}: NaN/Inf in targets, skipping")
-                    continue
-                
-                # Compute loss in float32 for stability
                 loss = criterion(preds_flat.float(), labels_flat.float())
                 
-                # Check for NaN/Inf in loss
                 if torch.isnan(loss) or torch.isinf(loss):
-                    skipped_due_to_invalid_loss += 1
-                    if rank == 0 and skipped_due_to_invalid_loss <= 5:
-                        log.warning(f"  Batch {batch_idx}: Loss is {loss.item()}, skipping")
+                    skipped_batches += 1
                     continue
                 
                 scaled_loss = loss / grad_accum
             
-            # Backward pass (outside autocast for full precision gradients)
             scaled_loss.backward()
         
-        valid_batches += 1
         bs = preds_flat.size(0)
         accumulated_loss += loss.item() * bs
         accumulated_samples += bs
         
-        # Store predictions for metrics
         all_preds.append(preprocessor.inverse_transform_time(preds_flat.detach().float().cpu().numpy()))
         all_targets.append(preprocessor.inverse_transform_time(labels_flat.float().cpu().numpy()))
         
         if should_sync:
-            # Compute gradient norm and clip
             grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
             
-            # Check for NaN/Inf gradients
-            if torch.isnan(grad_norm) or torch.isinf(grad_norm):
-                skipped_steps_due_to_nan += 1
-                if rank == 0 and skipped_steps_due_to_nan <= 5:
-                    log.warning(f"  Step {batch_idx}: Gradient norm is {grad_norm}, skipping optimizer step")
-                optimizer.zero_grad()
-                continue
+            if not (torch.isnan(grad_norm) or torch.isinf(grad_norm)):
+                optimizer.step()
+                num_optimizer_steps += 1
             
-            # Perform optimizer step
-            optimizer.step()
-            num_optimizer_steps += 1
             optimizer.zero_grad()
-            
-            # Accumulate totals
             total_loss += accumulated_loss
             total_samples += accumulated_samples
             accumulated_loss = 0.0
             accumulated_samples = 0
     
-    # Handle any remaining accumulated samples
     if accumulated_samples > 0:
         total_loss += accumulated_loss
         total_samples += accumulated_samples
     
     if total_samples == 0:
-        return {
-            'loss': 0.0, 'mae': 0.0, 'rmse': 0.0, 'mape': 0.0, 'r2': 0.0,
-            'num_optimizer_steps': num_optimizer_steps,
-            'valid_batches': valid_batches,
-            'skipped_batches': skipped_batches,
-            'skipped_steps_due_to_nan': skipped_steps_due_to_nan,
-            'skipped_due_to_invalid_loss': skipped_due_to_invalid_loss
-        }
+        return {'loss': 0.0, 'mae': 0.0, 'rmse': 0.0, 'mape': 0.0, 'r2': 0.0, 'num_optimizer_steps': 0}
     
     metrics = compute_metrics(np.concatenate(all_preds), np.concatenate(all_targets))
     metrics['loss'] = total_loss / total_samples
     metrics['num_optimizer_steps'] = num_optimizer_steps
-    metrics['valid_batches'] = valid_batches
     metrics['skipped_batches'] = skipped_batches
-    metrics['skipped_steps_due_to_nan'] = skipped_steps_due_to_nan
-    metrics['skipped_due_to_invalid_loss'] = skipped_due_to_invalid_loss
     return metrics
 
 
 @torch.no_grad()
-def validate(model, loader, criterion, device, preprocessor, use_amp=True):
+def validate(model, loader, criterion, device, preprocessor, use_amp: bool = True):
+    """Validate model."""
     model.eval()
     total_loss, total_samples = 0.0, 0
     all_preds, all_targets = [], []
@@ -689,12 +522,9 @@ def validate(model, loader, criterion, device, preprocessor, use_amp=True):
         batch = batch.to(device, non_blocking=True)
         
         with torch.amp.autocast('cuda', enabled=use_amp):
-            preds = model(batch)  # No mode parameter
+            preds = model(batch)
         
-        # Use edge_labels
         edge_labels = batch.edge_labels
-        
-        # Squeeze predictions if needed
         preds_flat = preds.squeeze(-1) if preds.dim() > 1 else preds
         labels_flat = edge_labels.squeeze(-1) if edge_labels.dim() > 1 else edge_labels
         
@@ -702,14 +532,11 @@ def validate(model, loader, criterion, device, preprocessor, use_amp=True):
             continue
         
         min_len = min(len(preds_flat), len(labels_flat))
-        preds_flat = preds_flat[:min_len]
-        labels_flat = labels_flat[:min_len]
+        preds_flat, labels_flat = preds_flat[:min_len], labels_flat[:min_len]
         
-        # Skip batches with NaN/Inf
         if torch.isnan(preds_flat).any() or torch.isinf(preds_flat).any():
             continue
         
-        # Compute loss in float32
         loss = criterion(preds_flat.float(), labels_flat.float())
         
         if torch.isnan(loss) or torch.isinf(loss):
@@ -730,63 +557,56 @@ def validate(model, loader, criterion, device, preprocessor, use_amp=True):
     return metrics
 
 
-def save_checkpoint(model, optimizer, scheduler, epoch, metrics,
-                    model_config, vocab_sizes, feature_dims, save_path, is_best=False):
-    model_to_save = model.module if hasattr(model, 'module') else model
-    checkpoint = {
-        'epoch': epoch,
-        'model_state_dict': model_to_save.state_dict(),
-        'optimizer_state_dict': optimizer.state_dict(),
-        'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
-        'model_config': model_config.to_dict(),
-        'vocab_sizes': vocab_sizes,
-        'feature_dims': feature_dims,
-        'metrics': metrics,
-        'is_best': is_best
-    }
-    temp_path = save_path + '.tmp'
-    torch.save(checkpoint, temp_path)
-    os.replace(temp_path, save_path)
-
-
 # =============================================================================
 # MAIN
 # =============================================================================
 
 def main():
-    args = parse_args()
-    shutdown = GracefulShutdown()
+    # Get config path from hyperparameters
+    config_path = os.environ.get('SM_HP_CONFIG_PATH', 's3://graph-transformer-exp/configs/config.json')
+    model_dir = os.environ.get('SM_MODEL_DIR', '/opt/ml/model')
     
+    # Setup distributed
     rank, local_rank, world_size = setup_distributed()
     device = torch.device(f'cuda:{local_rank}')
-    set_seed(args.seed, rank)
-    
     log = get_logger(rank)
     
-    use_amp = not args.disable_amp
+    # Load config from S3
+    log.info(f"Loading config from: {config_path}")
+    config = Config.load(config_path)
     
-    log.info("=" * 60)
-    log.info("DISTRIBUTED TRAINING (Zero Leakage)")
-    log.info("=" * 60)
+    # S3 output paths
+    s3_output_dir = config.s3_experiment_dir
+    s3_best_model = f"{s3_output_dir}/best_model.pt"
+    s3_results = f"{s3_output_dir}/results.json"
+    
+    set_seed(config.training.seed, rank)
+    shutdown = GracefulShutdown()
+    
+    log.info("=" * 70)
+    log.info(f"CAUSAL GRAPH TRANSFORMER TRAINING: {config.experiment_name}")
+    log.info("=" * 70)
     log.info(f"  World size: {world_size}, Rank: {rank}, Device: {device}")
-    log.info(f"  S3 cache: {args.cache_dir}")
-    log.info(f"  AMP (autocast): {use_amp}")
-    log.info(f"  Warmup epochs: {args.warmup_epochs}")
-    log.info("=" * 60)
+    log.info(f"  Epochs: {config.training.epochs}, Batch size: {config.training.batch_size}")
+    log.info(f"  LR: {config.training.learning_rate}, Hidden dim: {config.model.hidden_dim}")
+    log.info(f"  Layers: {config.model.num_layers}, Heads: {config.model.num_heads}")
+    log.info(f"  S3 Output: {s3_output_dir}")
+    log.info("=" * 70)
     
     try:
-        train_ds, val_ds, test_ds, preprocessor = load_and_prepare_data(
-            args, rank, local_rank, world_size, log
-        )
+        # Load data
+        train_ds, val_ds, test_ds, preprocessor = load_data(config, rank, local_rank, world_size, log)
         gc.collect()
         torch.cuda.empty_cache()
         
+        # Create dataloaders
         train_loader, val_loader, test_loader, train_sampler = create_dataloaders(
-            train_ds, val_ds, test_ds, args, rank, world_size
+            train_ds, val_ds, test_ds, config, rank, world_size
         )
         
-        model, model_config, vocab_sizes, feature_dims = create_model(
-            preprocessor, args, device, local_rank, world_size, rank
+        # Create model
+        model, vocab_sizes, feature_dims = create_model(
+            preprocessor, config, device, local_rank, world_size, rank
         )
         
         if rank == 0:
@@ -797,8 +617,8 @@ def main():
         # Optimizer
         optimizer = AdamW(
             model.parameters(),
-            lr=args.learning_rate,
-            weight_decay=args.weight_decay,
+            lr=config.training.learning_rate,
+            weight_decay=config.training.weight_decay,
             eps=1e-8
         )
         
@@ -806,46 +626,37 @@ def main():
         criterion = nn.MSELoss()
         
         # Early stopping
-        early_stopping = EarlyStopping(patience=args.patience, min_delta=args.min_delta)
+        early_stopping = EarlyStopping(
+            patience=config.training.patience,
+            min_delta=config.training.min_delta
+        )
         
-        # Learning rate scheduler with warmup
-        warmup_epochs = args.warmup_epochs
+        # Scheduler
+        warmup_epochs = config.training.warmup_epochs
         if warmup_epochs > 0:
-            warmup_scheduler = LinearLR(
-                optimizer,
-                start_factor=0.01,
-                end_factor=1.0,
-                total_iters=warmup_epochs
-            )
+            warmup_scheduler = LinearLR(optimizer, start_factor=0.01, end_factor=1.0, total_iters=warmup_epochs)
             main_scheduler = CosineAnnealingLR(
                 optimizer,
-                T_max=args.epochs - warmup_epochs,
-                eta_min=args.learning_rate * 0.01
+                T_max=config.training.epochs - warmup_epochs,
+                eta_min=config.training.learning_rate * config.training.min_lr_ratio
             )
-            scheduler = SequentialLR(
-                optimizer,
-                schedulers=[warmup_scheduler, main_scheduler],
-                milestones=[warmup_epochs]
-            )
-            log.info(f"Scheduler: LinearLR warmup ({warmup_epochs} epochs) -> CosineAnnealingLR")
+            scheduler = SequentialLR(optimizer, schedulers=[warmup_scheduler, main_scheduler], milestones=[warmup_epochs])
         else:
             scheduler = CosineAnnealingLR(
                 optimizer,
-                T_max=args.epochs,
-                eta_min=args.learning_rate * 0.01
+                T_max=config.training.epochs,
+                eta_min=config.training.learning_rate * config.training.min_lr_ratio
             )
-            log.info("Scheduler: CosineAnnealingLR (no warmup)")
         
         best_val_loss = float('inf')
         best_val_mae = float('inf')
         best_epoch = 0
-        total_optimizer_steps = 0
         
-        log.info("=" * 60)
-        log.info("TRAINING")
-        log.info("=" * 60)
+        log.info("=" * 70)
+        log.info("TRAINING LOOP")
+        log.info("=" * 70)
         
-        for epoch in range(1, args.epochs + 1):
+        for epoch in range(1, config.training.epochs + 1):
             if shutdown.should_stop:
                 log.info("Shutdown requested")
                 break
@@ -854,102 +665,75 @@ def main():
             if train_sampler:
                 train_sampler.set_epoch(epoch)
             
-            # Training (no forward_mode)
+            # Train
             train_metrics = train_epoch(
-                model, train_loader, optimizer, criterion, device, preprocessor,
-                args.gradient_accumulation_steps, rank, world_size,
-                max_grad_norm=args.max_grad_norm, epoch=epoch, use_amp=use_amp
+                model, train_loader, optimizer, criterion, device, preprocessor, config, rank, world_size, epoch
             )
             sync_barrier(device)
             
-            # Validation (no forward_mode)
-            val_metrics = validate(
-                model, val_loader, criterion, device, preprocessor, use_amp=use_amp
-            )
+            # Validate
+            val_metrics = validate(model, val_loader, criterion, device, preprocessor, config.training.use_amp)
             
-            # Track optimizer steps
-            epoch_optimizer_steps = train_metrics.get('num_optimizer_steps', 0)
-            total_optimizer_steps += epoch_optimizer_steps
-            
-            # Step scheduler AFTER training
             scheduler.step()
             
-            # Reduce metrics across workers
+            # Reduce metrics
             if world_size > 1:
-                train_metrics_to_reduce = {k: v for k, v in train_metrics.items() 
-                                          if k not in ['num_optimizer_steps', 'valid_batches', 
-                                                       'skipped_batches', 'skipped_steps_due_to_nan',
-                                                       'skipped_due_to_invalid_loss']}
-                val_metrics_to_reduce = {k: v for k, v in val_metrics.items()}
-                
-                train_metrics_reduced = reduce_metrics(train_metrics_to_reduce, device, world_size)
-                val_metrics = reduce_metrics(val_metrics_to_reduce, device, world_size)
-                
-                for key in ['num_optimizer_steps', 'valid_batches', 'skipped_batches', 
-                           'skipped_steps_due_to_nan', 'skipped_due_to_invalid_loss']:
-                    if key in train_metrics:
-                        t = torch.tensor(float(train_metrics[key]), device=device)
-                        dist.all_reduce(t, op=dist.ReduceOp.SUM)
-                        train_metrics_reduced[key] = int(t.item())
-                
-                train_metrics = train_metrics_reduced
+                train_metrics = reduce_metrics(train_metrics, device, world_size)
+                val_metrics = reduce_metrics(val_metrics, device, world_size)
             
             epoch_time = time.time() - epoch_start
             current_lr = scheduler.get_last_lr()[0]
             
-            # Log epoch results
-            log.info(f"Epoch {epoch}/{args.epochs} | Time: {epoch_time:.1f}s | LR: {current_lr:.2e}")
+            log.info(f"Epoch {epoch}/{config.training.epochs} | Time: {epoch_time:.1f}s | LR: {current_lr:.2e}")
             log.info(f"  Train - Loss: {train_metrics['loss']:.4f}, MAE: {train_metrics['mae']:.2f}h, R²: {train_metrics['r2']:.4f}")
             log.info(f"  Val   - Loss: {val_metrics['loss']:.4f}, MAE: {val_metrics['mae']:.2f}h, R²: {val_metrics['r2']:.4f}")
-            log.info(f"  Steps - Optimizer: {epoch_optimizer_steps}, Total: {total_optimizer_steps}")
             
-            # Warnings for potential issues
             if train_metrics.get('skipped_batches', 0) > 0:
-                log.warning(f"  ⚠ Skipped {train_metrics['skipped_batches']} batches (empty predictions)")
+                log.warning(f"  Skipped {train_metrics['skipped_batches']} batches due to NaN/Inf")
             
-            if train_metrics.get('skipped_steps_due_to_nan', 0) > 0:
-                log.warning(f"  ⚠ Skipped {train_metrics['skipped_steps_due_to_nan']} optimizer steps (inf/nan gradients)")
-            
-            if train_metrics.get('skipped_due_to_invalid_loss', 0) > 0:
-                log.warning(f"  ⚠ Skipped {train_metrics['skipped_due_to_invalid_loss']} batches (invalid loss/predictions)")
-            
-            if epoch_optimizer_steps == 0:
-                log.warning(f"  ⚠ No optimizer steps this epoch! Check data/model.")
-            
-            # Save best model
+            # Save checkpoints (rank 0 only)
             if rank == 0:
                 val_loss = val_metrics['loss']
                 val_mae = val_metrics['mae']
                 
+                # Save best model
                 if val_loss < float('inf') and val_loss < best_val_loss:
                     best_val_loss = val_loss
                     best_val_mae = val_mae
                     best_epoch = epoch
                     
+                    local_best_path = os.path.join(model_dir, 'best_model.pt')
                     save_checkpoint(
                         model, optimizer, scheduler, epoch,
                         {'val_loss': val_loss, 'val_mae': val_mae, 'val_r2': val_metrics['r2']},
-                        model_config, vocab_sizes, feature_dims,
-                        os.path.join(args.model_dir, 'best_model.pt'), is_best=True
+                        vocab_sizes, feature_dims, config,
+                        local_path=local_best_path,
+                        s3_path=s3_best_model,
+                        is_best=True,
+                        log=log
                     )
                     log.info(f"  ✓ New best model! (MAE: {best_val_mae:.2f}h)")
                 
                 # Periodic checkpoint
-                if epoch % args.checkpoint_frequency == 0:
+                if config.output.save_checkpoints and epoch % config.training.checkpoint_frequency == 0:
+                    local_ckpt_path = os.path.join(model_dir, f'checkpoint_epoch_{epoch}.pt')
+                    s3_ckpt_path = None if config.output.save_best_only else f"{s3_output_dir}/checkpoint_epoch_{epoch}.pt"
+                    
                     save_checkpoint(
                         model, optimizer, scheduler, epoch,
                         {'val_loss': val_loss, 'val_mae': val_mae},
-                        model_config, vocab_sizes, feature_dims,
-                        os.path.join(args.model_dir, f'checkpoint_epoch_{epoch}.pt')
+                        vocab_sizes, feature_dims, config,
+                        local_path=local_ckpt_path,
+                        s3_path=s3_ckpt_path,
+                        is_best=False,
+                        log=log
                     )
             
             # Early stopping
             should_stop = torch.tensor([0], device=device)
-            if rank == 0:
-                val_loss = val_metrics['loss']
-                if val_loss < float('inf') and early_stopping(val_loss):
-                    log.info(f"Early stopping at epoch {epoch}")
-                    should_stop[0] = 1
+            if rank == 0 and early_stopping(val_metrics['loss']):
+                log.info(f"Early stopping triggered at epoch {epoch}")
+                should_stop[0] = 1
             
             if world_size > 1:
                 dist.broadcast(should_stop, src=0)
@@ -960,40 +744,48 @@ def main():
         
         # Final test evaluation
         if rank == 0:
-            log.info("=" * 60)
-            log.info("TESTING")
-            log.info("=" * 60)
+            log.info("=" * 70)
+            log.info("FINAL TEST EVALUATION")
+            log.info("=" * 70)
             
-            best_path = os.path.join(args.model_dir, 'best_model.pt')
+            best_path = os.path.join(model_dir, 'best_model.pt')
             if os.path.exists(best_path):
                 ckpt = torch.load(best_path, map_location=device, weights_only=False)
                 m = model.module if hasattr(model, 'module') else model
                 m.load_state_dict(ckpt['model_state_dict'])
                 
-                test_metrics = validate(
-                    model, test_loader, criterion, device, preprocessor, use_amp=use_amp
-                )
+                test_metrics = validate(model, test_loader, criterion, device, preprocessor, config.training.use_amp)
                 
-                log.info(f"Test: MAE={test_metrics['mae']:.2f}h, RMSE={test_metrics['rmse']:.2f}h, R²={test_metrics['r2']:.4f}")
+                log.info(f"Test Results:")
+                log.info(f"  MAE:  {test_metrics['mae']:.2f} hours")
+                log.info(f"  RMSE: {test_metrics['rmse']:.2f} hours")
+                log.info(f"  MAPE: {test_metrics['mape']:.2f}%")
+                log.info(f"  R²:   {test_metrics['r2']:.4f}")
                 
                 # Save results
                 results = {
+                    'experiment_name': config.experiment_name,
                     'best_epoch': best_epoch,
                     'best_val_loss': float(best_val_loss),
                     'best_val_mae': float(best_val_mae),
                     'test_metrics': {k: float(v) for k, v in test_metrics.items()},
-                    'total_optimizer_steps': total_optimizer_steps,
-                    'args': vars(args)
+                    'config': config.to_dict()
                 }
                 
-                with open(os.path.join(args.model_dir, 'results.json'), 'w') as f:
+                # Save locally
+                local_results_path = os.path.join(model_dir, 'results.json')
+                with open(local_results_path, 'w') as f:
                     json.dump(results, f, indent=2)
-            else:
-                log.warning("No best model found!")
+                
+                # Upload to S3
+                upload_dict_to_s3(results, s3_results, log)
             
-            log.info("=" * 60)
-            log.info(f"COMPLETE! Best epoch: {best_epoch}, Val MAE: {best_val_mae:.2f}h")
-            log.info("=" * 60)
+            log.info("=" * 70)
+            log.info(f"TRAINING COMPLETE!")
+            log.info(f"  Best epoch: {best_epoch}")
+            log.info(f"  Best Val MAE: {best_val_mae:.2f} hours")
+            log.info(f"  S3 Output: {s3_output_dir}")
+            log.info("=" * 70)
     
     except Exception as e:
         logging.error(f"[Rank {rank}] Error: {e}")

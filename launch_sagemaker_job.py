@@ -15,7 +15,7 @@ def launch_distributed_training(
     instance_count=1,
     source_dir='.',
     entry_point='sagemaker_train.py',
-    s3_data_path='s3://graph-transformer-exp/data/',
+    s3_data_path='s3://graph-transformer-exp/package-lifecycle/cache/test/',
     s3_output_path='s3://graph-transformer-exp/output/',
     role=None,
     max_run_hours=240,
@@ -144,9 +144,6 @@ if __name__ == '__main__':
     
     parser = argparse.ArgumentParser(description='Launch SageMaker distributed training')
     
-    # Required
-    parser.add_argument('--s3-data', type=str, required=True, help='S3 path to training data')
-    parser.add_argument('--s3-output', type=str, required=True, help='S3 path for output')
     
     # Instance
     parser.add_argument('--instance-type', type=str, default='ml.p3.16xlarge')
@@ -191,8 +188,6 @@ if __name__ == '__main__':
     launch_distributed_training(
         instance_type=args.instance_type,
         instance_count=args.instance_count,
-        s3_data_path=args.s3_data,
-        s3_output_path=args.s3_output,
         role=args.role,
         hyperparameters=hyperparameters,
         source_dir=args.source_dir,

@@ -1,5 +1,8 @@
 """
-models/causal_graph_transformer.py - Causal Graph Transformer with ZERO Feature Leakage
+models/causal_graph_transformer.py - Optimized Causal Graph Transformer
+
+Handles variable length sequences with ZERO feature leakage.
+Labels are organized by package, but processing is optimized by position.
 """
 
 import torch
@@ -7,12 +10,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.nn import TransformerConv
 import math
-from typing import Dict, List, Optional
-import numpy as np
+from typing import Dict, List, Optional, Tuple
+from collections import defaultdict
 
 
 class MultiEmbedding(nn.Module):
-    """Module for handling multiple categorical embeddings"""
+    """Module for handling multiple categorical embeddings."""
     
     def __init__(self, vocab_sizes: Dict[str, int], embed_dim: int, 
                  feature_names: List[str], dropout: float = 0.1):
@@ -20,13 +23,10 @@ class MultiEmbedding(nn.Module):
         
         self.embed_dim = embed_dim
         self.feature_names = feature_names
-        
         self.embeddings = nn.ModuleDict()
         
         for name in feature_names:
-            base_name = self._get_base_vocab_name(name, vocab_sizes)
-            vocab_size = vocab_sizes.get(base_name, 100)
-            
+            vocab_size = vocab_sizes.get(name, 100)
             self.embeddings[name] = nn.Embedding(
                 num_embeddings=vocab_size,
                 embedding_dim=embed_dim,
@@ -35,22 +35,6 @@ class MultiEmbedding(nn.Module):
         
         self.dropout = nn.Dropout(dropout)
         self._init_embeddings()
-    
-    def _get_base_vocab_name(self, name: str, vocab_sizes: Dict[str, int]) -> str:
-        if name in vocab_sizes:
-            return name
-        
-        mappings = {
-            'event_type': 'event_type',
-            'location': 'location',
-            'region': 'region',
-            'carrier': 'carrier',
-            'leg_type': 'leg_type',
-            'ship_method': 'ship_method',
-            'postal': 'postal',
-        }
-        
-        return mappings.get(name, name)
     
     def _init_embeddings(self):
         for emb in self.embeddings.values():
@@ -61,10 +45,14 @@ class MultiEmbedding(nn.Module):
     def forward(self, indices: Dict[str, torch.Tensor]) -> torch.Tensor:
         embeddings = []
         for name in self.feature_names:
-            if name in indices:
+            if name in indices and name in self.embeddings:
                 emb = self.embeddings[name](indices[name])
                 emb = self.dropout(emb)
                 embeddings.append(emb)
+        
+        if not embeddings:
+            raise ValueError(f"No embeddings found. Expected: {self.feature_names}, Got: {list(indices.keys())}")
+        
         return torch.cat(embeddings, dim=-1)
     
     def get_output_dim(self) -> int:
@@ -72,9 +60,9 @@ class MultiEmbedding(nn.Module):
 
 
 class PositionalEncoding(nn.Module):
-    """Positional encoding for sequential data"""
+    """Sinusoidal positional encoding."""
     
-    def __init__(self, d_model: int, max_len: int = 100):
+    def __init__(self, d_model: int, max_len: int = 200):
         super().__init__()
         
         pe = torch.zeros(max_len, d_model)
@@ -89,14 +77,14 @@ class PositionalEncoding(nn.Module):
         
         self.register_buffer('pe', pe)
     
-    def forward(self, x: torch.Tensor, batch: torch.Tensor) -> torch.Tensor:
-        _, counts = torch.unique(batch, return_counts=True)
-        positions = torch.cat([torch.arange(c, device=x.device) for c in counts])
+    def forward(self, x: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+        """Add positional encoding based on positions tensor."""
+        positions = positions.clamp(0, self.pe.size(0) - 1)
         return x + self.pe[positions]
 
 
 class GraphTransformerLayer(nn.Module):
-    """Standard Graph Transformer layer - attention follows edge_index"""
+    """Graph Transformer layer with edge features."""
     
     def __init__(self, hidden_dim: int, num_heads: int, dropout: float = 0.1,
                  edge_dim: Optional[int] = None):
@@ -125,141 +113,214 @@ class GraphTransformerLayer(nn.Module):
     
     def forward(self, x: torch.Tensor, edge_index: torch.Tensor,
                 edge_attr: Optional[torch.Tensor] = None) -> torch.Tensor:
+        # Graph attention
         h = self.transformer_conv(x, edge_index, edge_attr)
         x = self.norm1(x + h)
+        
+        # FFN
         h = self.ffn(x)
         x = self.norm2(x + h)
+        
         return x
 
 
-class GraphTransformerWithEmbeddings(nn.Module):
+class CausalGraphTransformer(nn.Module):
     """
-    Causal Graph Transformer with ZERO Feature Leakage.
+    Optimized Causal Graph Transformer for Transit Time Prediction.
     
-    For each edge prediction (source → target):
-    - Nodes 0 to source: use observable + realized features
-    - Nodes source+1 to N-1: use observable + ZEROS (realized zeroed out)
+    ════════════════════════════════════════════════════════════════════════════
+    CAUSAL MASKING - ZERO FEATURE LEAKAGE
+    ════════════════════════════════════════════════════════════════════════════
     
-    This guarantees no information from future events leaks into predictions.
+    For predicting edge (source → target):
+    - Nodes at position ≤ source position: use OBSERVABLE + REALIZED features
+    - Nodes at position > source position: use OBSERVABLE + ZEROS (realized masked)
+    
+    This ensures no information from future events leaks into predictions.
+    
+    ════════════════════════════════════════════════════════════════════════════
+    OPTIMIZATION - PROCESS BY POSITION
+    ════════════════════════════════════════════════════════════════════════════
+    
+    Instead of running transformer once per edge (O(E) passes),
+    we run once per unique source position (O(P) passes where P << E).
+    
+    Edges with same source position share the same causal mask!
+    
+    Speedup: E/P ≈ (batch_size × avg_edges_per_package) / max_seq_len ≈ 100-1000x
+    
+    ════════════════════════════════════════════════════════════════════════════
+    VARIABLE LENGTH HANDLING
+    ════════════════════════════════════════════════════════════════════════════
+    
+    Each package can have different number of events. Handled automatically:
+    - Position tensor tracks each node's position within its package
+    - Edges grouped by source position (not by package)
+    - Labels stored by package, predictions stored at original edge indices
+    
+    ════════════════════════════════════════════════════════════════════════════
     """
     
-    def __init__(self, config, vocab_sizes: Dict[str, int], feature_dims: Dict = None):
+    def __init__(
+        self,
+        vocab_sizes: Dict[str, int],
+        feature_dims: Dict[str, int],
+        hidden_dim: int = 256,
+        num_layers: int = 4,
+        num_heads: int = 8,
+        dropout: float = 0.1,
+        embed_dim: int = 32,
+        output_dim: int = 1,
+        use_edge_features: bool = True,
+    ):
         super().__init__()
         
-        self.config = config
-        self.vocab_sizes = vocab_sizes
+        self.hidden_dim = hidden_dim
+        self.num_layers = num_layers
+        self.num_heads = num_heads
+        self.output_dim = output_dim
+        self.use_edge_features = use_edge_features
         
-        # Get feature dimensions
-        if feature_dims is None:
-            observable_dim = getattr(config, 'observable_dim', 11)
-            realized_dim = getattr(config, 'realized_dim', 20)
-            edge_dim = getattr(config, 'edge_dim', 8)
-            package_dim = getattr(config, 'package_dim', 4)
-        else:
-            observable_dim = feature_dims['observable_dim']
-            realized_dim = feature_dims['realized_dim']
-            edge_dim = feature_dims['edge_dim']
-            package_dim = feature_dims['package_dim']
+        # Store dimensions
+        self.observable_dim = feature_dims.get('observable_dim', 11)
+        self.realized_dim = feature_dims.get('realized_dim', 20)
+        self.edge_dim = feature_dims.get('edge_dim', 8)
+        self.package_dim = feature_dims.get('package_dim', 4)
         
-        self.observable_dim = observable_dim
-        self.realized_dim = realized_dim
-        
-        # === Node Categorical Embeddings ===
+        # ════════════════════════════════════════════════════════════════
+        # NODE CATEGORICAL EMBEDDINGS
+        # ════════════════════════════════════════════════════════════════
         node_categorical_features = [
             'event_type', 'location', 'postal', 'region',
             'carrier', 'leg_type', 'ship_method'
         ]
+        # Filter to only features that exist in vocab_sizes
+        self.node_categorical_features = [
+            f for f in node_categorical_features if f in vocab_sizes
+        ]
+        
         self.node_embedding = MultiEmbedding(
             vocab_sizes=vocab_sizes,
-            embed_dim=config.embed_dim,
-            feature_names=node_categorical_features,
-            dropout=config.dropout
+            embed_dim=embed_dim,
+            feature_names=self.node_categorical_features,
+            dropout=dropout
         )
         
-        # === Package Postal Embeddings ===
+        # ════════════════════════════════════════════════════════════════
+        # PACKAGE POSTAL EMBEDDINGS
+        # ════════════════════════════════════════════════════════════════
         self.postal_embedding = nn.Embedding(
             num_embeddings=vocab_sizes.get('postal', 1000),
-            embedding_dim=config.embed_dim,
+            embedding_dim=embed_dim,
             padding_idx=0
         )
         nn.init.normal_(self.postal_embedding.weight, mean=0, std=0.02)
         with torch.no_grad():
             self.postal_embedding.weight[0].fill_(0)
         
-        # === Calculate Input Dimensions ===
+        # ════════════════════════════════════════════════════════════════
+        # CALCULATE INPUT DIMENSIONS
+        # ════════════════════════════════════════════════════════════════
         node_cat_dim = self.node_embedding.get_output_dim()
-        package_postal_dim = config.embed_dim * 2
+        package_postal_dim = embed_dim * 2  # source + dest postal
         
-        observable_input_dim = observable_dim + node_cat_dim + package_postal_dim + package_dim
-        realized_input_dim = realized_dim
+        observable_input_dim = (
+            self.observable_dim +      # continuous observable features
+            node_cat_dim +             # categorical embeddings
+            package_postal_dim +       # package postal embeddings
+            self.package_dim           # package features
+        )
         
-        print(f"\n=== Zero-Leakage Causal Model ===")
-        print(f"Observable input dim: {observable_input_dim}")
-        print(f"Realized input dim: {realized_input_dim}")
-        print(f"Edge input dim: {edge_dim}")
-        print(f"Hidden dim: {config.hidden_dim}")
+        print(f"\n{'='*70}")
+        print(f"CAUSAL GRAPH TRANSFORMER (Optimized)")
+        print(f"{'='*70}")
+        print(f"Observable input: {observable_input_dim}")
+        print(f"  - Continuous: {self.observable_dim}")
+        print(f"  - Categorical ({len(self.node_categorical_features)}): {node_cat_dim}")
+        print(f"  - Package postal: {package_postal_dim}")
+        print(f"  - Package features: {self.package_dim}")
+        print(f"Realized input: {self.realized_dim}")
+        print(f"Edge input: {self.edge_dim}")
+        print(f"Hidden dim: {hidden_dim}")
+        print(f"Layers: {num_layers}, Heads: {num_heads}")
+        print(f"{'='*70}")
         
-        # === Input Projections ===
+        # ════════════════════════════════════════════════════════════════
+        # INPUT PROJECTIONS
+        # ════════════════════════════════════════════════════════════════
+        
+        # Project observable features → hidden_dim
         self.observable_proj = nn.Sequential(
-            nn.Linear(observable_input_dim, config.hidden_dim),
-            nn.LayerNorm(config.hidden_dim),
+            nn.Linear(observable_input_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
             nn.GELU(),
-            nn.Dropout(config.dropout)
+            nn.Dropout(dropout)
         )
         
+        # Project realized features → hidden_dim
         self.realized_proj = nn.Sequential(
-            nn.Linear(realized_input_dim, config.hidden_dim),
-            nn.LayerNorm(config.hidden_dim),
+            nn.Linear(self.realized_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
             nn.GELU(),
-            nn.Dropout(config.dropout)
+            nn.Dropout(dropout)
         )
         
+        # Combine observable + masked realized → hidden_dim
         self.combine_proj = nn.Sequential(
-            nn.Linear(config.hidden_dim * 2, config.hidden_dim),
-            nn.LayerNorm(config.hidden_dim),
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.LayerNorm(hidden_dim),
             nn.GELU(),
-            nn.Dropout(config.dropout)
+            nn.Dropout(dropout)
         )
         
+        # Project edge features → hidden_dim
         self.edge_proj = nn.Sequential(
-            nn.Linear(edge_dim, config.hidden_dim),
-            nn.LayerNorm(config.hidden_dim),
+            nn.Linear(self.edge_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
             nn.GELU(),
-            nn.Dropout(config.dropout)
+            nn.Dropout(dropout)
         )
         
-        # === Positional Encoding ===
-        self.pos_encoding = PositionalEncoding(config.hidden_dim, max_len=100)
+        # ════════════════════════════════════════════════════════════════
+        # POSITIONAL ENCODING
+        # ════════════════════════════════════════════════════════════════
+        self.pos_encoding = PositionalEncoding(hidden_dim, max_len=200)
         
-        # === Transformer Layers ===
+        # ════════════════════════════════════════════════════════════════
+        # TRANSFORMER LAYERS
+        # ════════════════════════════════════════════════════════════════
         self.layers = nn.ModuleList([
             GraphTransformerLayer(
-                hidden_dim=config.hidden_dim,
-                num_heads=config.num_heads,
-                dropout=config.dropout,
-                edge_dim=config.hidden_dim if config.use_edge_features else None
+                hidden_dim=hidden_dim,
+                num_heads=num_heads,
+                dropout=dropout,
+                edge_dim=hidden_dim if use_edge_features else None
             )
-            for _ in range(config.num_layers)
+            for _ in range(num_layers)
         ])
         
-        # === Output Head ===
+        # ════════════════════════════════════════════════════════════════
+        # OUTPUT HEAD
+        # ════════════════════════════════════════════════════════════════
         self.output_head = nn.Sequential(
-            nn.Linear(config.hidden_dim * 2, config.hidden_dim),
-            nn.LayerNorm(config.hidden_dim),
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.LayerNorm(hidden_dim),
             nn.GELU(),
-            nn.Dropout(config.dropout),
-            nn.Linear(config.hidden_dim, config.hidden_dim // 2),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, hidden_dim // 2),
             nn.GELU(),
-            nn.Linear(config.hidden_dim // 2, config.output_dim)
+            nn.Dropout(dropout / 2),
+            nn.Linear(hidden_dim // 2, output_dim)
         )
         
         self._init_weights()
         
         params = self.get_num_parameters()
-        print(f"Total parameters: {params['total']:,}")
-        print(f"Trainable parameters: {params['trainable']:,}")
+        print(f"Parameters: {params['total']:,} total, {params['trainable']:,} trainable")
+        print(f"{'='*70}\n")
     
     def _init_weights(self):
+        """Initialize linear layer weights."""
         for module in [self.observable_proj, self.realized_proj, 
                        self.combine_proj, self.edge_proj, self.output_head]:
             for layer in module:
@@ -268,13 +329,21 @@ class GraphTransformerWithEmbeddings(nn.Module):
                     if layer.bias is not None:
                         nn.init.zeros_(layer.bias)
     
-    def _get_node_positions(self, batch: torch.Tensor) -> torch.Tensor:
-        """Get position of each node within its graph."""
+    def _compute_node_positions(self, batch: torch.Tensor) -> torch.Tensor:
+        """
+        Compute position of each node within its graph.
+        
+        Example:
+            batch = [0, 0, 0, 1, 1, 1, 1, 1, 2, 2]  (3 packages)
+            returns [0, 1, 2, 0, 1, 2, 3, 4, 0, 1]  (positions within each)
+        """
         device = batch.device
         num_nodes = batch.size(0)
         positions = torch.zeros(num_nodes, dtype=torch.long, device=device)
         
-        _, counts = torch.unique(batch, return_counts=True)
+        # Get counts per graph using unique_consecutive (assumes sorted batch)
+        _, counts = torch.unique_consecutive(batch, return_counts=True)
+        
         offset = 0
         for count in counts:
             positions[offset:offset + count] = torch.arange(count, device=device)
@@ -282,182 +351,243 @@ class GraphTransformerWithEmbeddings(nn.Module):
         
         return positions
     
+    def _group_edges_by_source_position(
+        self, 
+        edge_index: torch.Tensor, 
+        positions: torch.Tensor
+    ) -> Dict[int, torch.Tensor]:
+        """
+        Group edge indices by their source node's position.
+        
+        This is the KEY OPTIMIZATION: edges with same source position
+        share the same causal mask.
+        
+        Example:
+            Edge sources at positions: [0, 1, 0, 1, 2, 3, 0]
+            Returns: {
+                0: tensor([0, 2, 6]),  # edges with source at position 0
+                1: tensor([1, 3]),     # edges with source at position 1
+                2: tensor([4]),
+                3: tensor([5])
+            }
+        """
+        source_nodes = edge_index[0]
+        source_positions = positions[source_nodes]  # [E]
+        
+        unique_positions = torch.unique(source_positions)
+        
+        position_to_edges = {}
+        for pos in unique_positions.tolist():
+            mask = (source_positions == pos)
+            position_to_edges[pos] = torch.where(mask)[0]
+        
+        return position_to_edges
+    
     def _build_observable_features(self, data) -> torch.Tensor:
         """
         Build observable features for all nodes.
-        Observable features are always available (known before event happens).
         
-        Returns:
-            observable_hidden: [num_nodes, hidden_dim]
+        Observable features are ALWAYS available (known before event happens):
+        - Continuous: time encodings, position, coordinates
+        - Categorical: event type, location, carrier, etc.
+        - Package: origin/destination, weight, etc.
         """
         batch = data.batch
         
-        # Continuous observable features
+        # 1. Continuous observable features [N, observable_dim]
         node_observable = data.node_observable
         
-        # Categorical embeddings
-        node_cat_indices = {
-            'event_type': data.event_type_idx,
-            'location': data.location_idx,
-            'postal': data.postal_idx,
-            'region': data.region_idx,
-            'carrier': data.carrier_idx,
-            'leg_type': data.leg_type_idx,
-            'ship_method': data.ship_method_idx,
-        }
+        # 2. Categorical embeddings [N, cat_dim]
+        node_cat_indices = {}
+        for name in self.node_categorical_features:
+            attr_name = f"{name}_idx"
+            if hasattr(data, attr_name):
+                node_cat_indices[name] = getattr(data, attr_name)
+        
         node_cat_emb = self.node_embedding(node_cat_indices)
         
-        # Package postal embeddings (expanded to nodes)
-        source_postal_emb = self.postal_embedding(data.source_postal_idx)
-        dest_postal_emb = self.postal_embedding(data.dest_postal_idx)
+        # 3. Package postal embeddings [N, 2*embed_dim]
+        # These are package-level, expanded to all nodes
+        source_postal_emb = self.postal_embedding(data.source_postal_idx)  # [G, embed]
+        dest_postal_emb = self.postal_embedding(data.dest_postal_idx)      # [G, embed]
         package_postal_emb = torch.cat([
-            source_postal_emb[batch],
-            dest_postal_emb[batch]
+            source_postal_emb[batch],  # [N, embed]
+            dest_postal_emb[batch]     # [N, embed]
         ], dim=-1)
         
-        # Package features (expanded to nodes)
+        # 4. Package features [N, package_dim]
         package_features = data.package_features[batch]
         
-        # Combine all observable
+        # Combine all observable features
         observable_combined = torch.cat([
-            node_observable,
-            node_cat_emb,
-            package_postal_emb,
-            package_features
+            node_observable,      # [N, obs_dim]
+            node_cat_emb,         # [N, cat_dim]
+            package_postal_emb,   # [N, 2*embed]
+            package_features      # [N, pkg_dim]
         ], dim=-1)
         
-        return self.observable_proj(observable_combined)
+        return self.observable_proj(observable_combined)  # [N, hidden_dim]
     
-    def _build_realized_features(self, data) -> torch.Tensor:
+    def _apply_causal_mask(
+        self, 
+        observable_hidden: torch.Tensor,
+        realized_hidden: torch.Tensor, 
+        positions: torch.Tensor,
+        current_position: int
+    ) -> torch.Tensor:
         """
-        Build realized features for all nodes (before masking).
+        Apply causal mask and combine features.
         
-        Returns:
-            realized_hidden: [num_nodes, hidden_dim]
-        """
-        return self.realized_proj(data.node_realized)
-    
-    def _build_causal_mask(self, source_node_idx: int, batch: torch.Tensor, 
-                           positions: torch.Tensor) -> torch.Tensor:
-        """
-        Build causal mask for a specific edge.
-        
-        For edge with source node at position P in graph G:
-        - Nodes in graph G with position <= P: mask = True (use realized)
-        - Nodes in graph G with position > P: mask = False (zero realized)
-        - Nodes in other graphs: mask = True (doesn't affect this prediction)
+        For position P:
+        - Nodes at position ≤ P: KEEP realized (events have happened)
+        - Nodes at position > P: ZERO realized (future events)
         
         Args:
-            source_node_idx: Global index of source node
-            batch: [num_nodes] graph assignment
-            positions: [num_nodes] position within each graph
-        
-        Returns:
-            causal_mask: [num_nodes] boolean
+            observable_hidden: [N, H] - always available
+            realized_hidden: [N, H] - to be masked
+            positions: [N] - position of each node
+            current_position: P - source position we're predicting from
         """
-        device = batch.device
-        num_nodes = batch.size(0)
+        # Mask: True = keep realized, False = zero realized
+        causal_mask = (positions <= current_position)  # [N]
         
-        source_graph = batch[source_node_idx]
-        source_position = positions[source_node_idx]
-        
-        # Mask for nodes in the same graph
-        same_graph = (batch == source_graph)
-        
-        # Mask for nodes at or before source position
-        position_ok = (positions <= source_position)
-        
-        # Final mask: 
-        # - Same graph AND position <= source: True (happened)
-        # - Different graph: True (doesn't matter, won't affect this prediction)
-        # - Same graph AND position > source: False (future, zero out)
-        causal_mask = ~same_graph | (same_graph & position_ok)
-        
-        return causal_mask
-    
-    def _apply_causal_mask(self, observable_hidden: torch.Tensor, 
-                           realized_hidden: torch.Tensor,
-                           causal_mask: torch.Tensor) -> torch.Tensor:
-        """
-        Combine observable and masked realized features.
-        
-        Args:
-            observable_hidden: [num_nodes, hidden_dim]
-            realized_hidden: [num_nodes, hidden_dim]
-            causal_mask: [num_nodes] boolean
-        
-        Returns:
-            node_hidden: [num_nodes, hidden_dim]
-        """
-        # Zero out realized features for future nodes
+        # Expand mask for element-wise multiplication
         mask_expanded = causal_mask.unsqueeze(-1).float()  # [N, 1]
-        realized_masked = realized_hidden * mask_expanded   # [N, H]
         
-        # Combine
-        combined = torch.cat([observable_hidden, realized_masked], dim=-1)
-        return self.combine_proj(combined)
+        # Zero out future nodes' realized features
+        realized_masked = realized_hidden * mask_expanded  # [N, H]
+        
+        # Combine observable (always available) with masked realized
+        combined = torch.cat([observable_hidden, realized_masked], dim=-1)  # [N, 2H]
+        
+        return self.combine_proj(combined)  # [N, H]
     
     def forward(self, data) -> torch.Tensor:
         """
-        Forward pass with ZERO feature leakage.
+        Forward pass with causal masking - optimized by position.
         
-        For each edge, we:
-        1. Build causal mask based on source node position
-        2. Zero out realized features for future nodes
-        3. Run transformer
-        4. Predict from source node representation
+        ════════════════════════════════════════════════════════════════════
+        ALGORITHM
+        ════════════════════════════════════════════════════════════════════
+        
+        1. PRECOMPUTE (once for batch):
+           - Observable features for all nodes
+           - Realized features for all nodes (before masking)
+           - Edge features
+           - Node positions
+           - Group edges by source position
+        
+        2. FOR EACH UNIQUE POSITION P (not each edge!):
+           a. Build causal mask: nodes ≤ P keep realized, others get zeros
+           b. Combine observable + masked realized
+           c. Run transformer layers
+           d. Predict for ALL edges with source at position P
+           e. Store predictions at original edge indices
+        
+        3. RETURN predictions aligned with data.edge_labels
+        
+        ════════════════════════════════════════════════════════════════════
+        
+        Args:
+            data: PyG Batch with:
+                - node_observable: [N, obs_dim]
+                - node_realized: [N, real_dim]
+                - edge_features: [E, edge_dim]
+                - edge_index: [2, E]
+                - batch: [N]
+                - edge_labels: [E] - targets (for loss computation externally)
         
         Returns:
-            predictions: [num_edges, output_dim]
+            predictions: [E, output_dim] - aligned with edge_labels by index
         """
         device = data.node_observable.device
         batch = data.batch
         edge_index = data.edge_index
-        num_edges = edge_index.shape[1]
+        num_edges = edge_index.size(1)
         
+        # Handle empty batch
         if num_edges == 0:
-            return torch.zeros((0, self.config.output_dim), device=device)
+            return torch.zeros((0, self.output_dim), device=device)
         
-        # Precompute features that don't depend on causal mask
+        # ════════════════════════════════════════════════════════════════
+        # STEP 1: PRECOMPUTE (once for entire batch)
+        # ════════════════════════════════════════════════════════════════
+        
+        # Observable features - always available for all nodes
         observable_hidden = self._build_observable_features(data)  # [N, H]
-        realized_hidden = self._build_realized_features(data)       # [N, H]
-        edge_hidden = self.edge_proj(data.edge_features)            # [E, H]
-        positions = self._get_node_positions(batch)                  # [N]
         
-        # Process each edge with its own causal mask
-        all_predictions = []
-        source_nodes = edge_index[0]
+        # Realized features - will be masked based on causal position
+        realized_hidden = self.realized_proj(data.node_realized)   # [N, H]
         
-        for e_idx in range(num_edges):
-            source_idx = source_nodes[e_idx].item()
+        # Edge features
+        edge_hidden = self.edge_proj(data.edge_features)           # [E, H]
+        
+        # Compute node positions within each graph
+        positions = self._compute_node_positions(batch)             # [N]
+        
+        # Group edges by source position (KEY OPTIMIZATION)
+        position_to_edges = self._group_edges_by_source_position(
+            edge_index, positions
+        )
+        
+        # ════════════════════════════════════════════════════════════════
+        # STEP 2: ALLOCATE OUTPUT (same order as edge_labels)
+        # ════════════════════════════════════════════════════════════════
+        
+        predictions = torch.zeros(num_edges, self.output_dim, device=device)
+        
+        # ════════════════════════════════════════════════════════════════
+        # STEP 3: PROCESS EACH UNIQUE POSITION
+        # ════════════════════════════════════════════════════════════════
+        
+        for pos in sorted(position_to_edges.keys()):
+            edge_indices = position_to_edges[pos]  # Tensor of edge indices
             
-            # Build causal mask for this edge
-            causal_mask = self._build_causal_mask(source_idx, batch, positions)
-            
-            # Apply mask and combine features
+            # ────────────────────────────────────────────────────────────
+            # 3a. Apply causal mask for this position
+            # ────────────────────────────────────────────────────────────
             node_hidden = self._apply_causal_mask(
-                observable_hidden, realized_hidden, causal_mask
-            )
+                observable_hidden, 
+                realized_hidden, 
+                positions, 
+                current_position=pos
+            )  # [N, H]
             
-            # Add positional encoding
-            node_hidden = self.pos_encoding(node_hidden, batch)
+            # ────────────────────────────────────────────────────────────
+            # 3b. Add positional encoding
+            # ────────────────────────────────────────────────────────────
+            node_hidden = self.pos_encoding(node_hidden, positions)  # [N, H]
             
-            # Run transformer layers
+            # ────────────────────────────────────────────────────────────
+            # 3c. Run transformer layers
+            # ────────────────────────────────────────────────────────────
             for layer in self.layers:
-                node_hidden = layer(node_hidden, edge_index, edge_hidden)
+                node_hidden = layer(
+                    node_hidden, 
+                    edge_index, 
+                    edge_hidden if self.use_edge_features else None
+                )
             
-            # Get source node representation
-            source_hidden = node_hidden[source_idx:source_idx + 1]  # [1, H]
-            this_edge_hidden = edge_hidden[e_idx:e_idx + 1]         # [1, H]
+            # ────────────────────────────────────────────────────────────
+            # 3d. Batch predict for ALL edges at this position
+            # ────────────────────────────────────────────────────────────
+            source_indices = edge_index[0, edge_indices]  # [num_edges_at_pos]
             
-            # Predict
-            combined = torch.cat([source_hidden, this_edge_hidden], dim=-1)
-            pred = self.output_head(combined)
-            all_predictions.append(pred)
+            source_hidden = node_hidden[source_indices]   # [num_edges_at_pos, H]
+            edges_hidden = edge_hidden[edge_indices]      # [num_edges_at_pos, H]
+            
+            combined = torch.cat([source_hidden, edges_hidden], dim=-1)  # [*, 2H]
+            preds = self.output_head(combined)                            # [*, output_dim]
+            
+            # ────────────────────────────────────────────────────────────
+            # 3e. Store at ORIGINAL indices (aligns with edge_labels)
+            # ────────────────────────────────────────────────────────────
+            predictions[edge_indices] = preds
         
-        return torch.cat(all_predictions, dim=0)
+        return predictions  # [E, output_dim] - aligned with data.edge_labels
     
     def get_num_parameters(self) -> Dict[str, int]:
+        """Count model parameters."""
         total = sum(p.numel() for p in self.parameters())
         trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
         return {'total': total, 'trainable': trainable}
