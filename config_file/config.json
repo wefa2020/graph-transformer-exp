@@ -8,7 +8,7 @@
     "distance_file": "s3://graph-transformer-exp/data/location_distances_complete.csv",
     "cache_dir": "s3://graph-transformer-exp/cache",
     "preprocessor_path": "s3://graph-transformer-exp/cache/preprocessor.pkl",
-    "num_workers": 4,
+    "num_workers": 32,
     "event_types": ["INDUCT", "EXIT", "LINEHAUL", "DELIVERY"],
     "problem_types": ["NO_PROBLEM", "DAMAGED_LABEL", "WRONG_NODE", "DAMAGED_PACKAGE_REPAIRABLE", "DAMAGED_PACKAGE", "DAMAGED_ITEM", "CPT_EXPIRED", "UNSUPPORTED_HAZMAT", "PARTIAL_SHIPMENT",
                        "EMPTY_SHIPMENT", "VAS_PRINT_LABEL", "COMPLETE_SHIPMENT", "CANCELLED", "RESERVATION_EXPIRED", "OVERWEIGHT", "CRUSHED_BOX", "REPACK", "HOLE_IN_BOX", "TAPE_ISSUE", 
