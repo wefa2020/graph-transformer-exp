@@ -7,6 +7,7 @@ Data paths are specified in config.
 Dataset writes H5 files directly to S3.
 
 Supports loading multiple JSON files from a local folder.
+Only loads JSON files starting with "data_part" prefix.
 
 python h5_maker.py --data-folder ./data/graph-data --config ./config_file/config.json
 python h5_maker.py --data-folder s3://graph-transformer-exp/data/test.json --config s3://graph-transformer-exp/configs/config.json
@@ -42,6 +43,9 @@ LOCAL_DATA_FOLDER = "./data/graph-data"
 
 # Package ID prefix filter
 PACKAGE_ID_PREFIX = "TBA"
+
+# JSON file prefix filter
+JSON_FILE_PREFIX = "data_part"
 
 
 class ProgressTracker:
@@ -181,16 +185,21 @@ def filter_by_package_id_prefix(df: pd.DataFrame, prefix: str = PACKAGE_ID_PREFI
     return filtered_df
 
 
-def load_json_files_from_folder(folder_path: str, progress: Optional[ProgressTracker] = None) -> pd.DataFrame:
+def load_json_files_from_folder(
+    folder_path: str, 
+    file_prefix: str = JSON_FILE_PREFIX,
+    progress: Optional[ProgressTracker] = None
+) -> pd.DataFrame:
     """
-    Load all JSON files from a folder and concatenate them.
+    Load JSON files from a folder that start with specified prefix and concatenate them.
     
     Args:
         folder_path: Path to folder containing JSON files
+        file_prefix: Only load files starting with this prefix (default: 'data_part')
         progress: Optional progress tracker
         
     Returns:
-        Concatenated DataFrame from all JSON files
+        Concatenated DataFrame from all matching JSON files
     """
     folder = Path(folder_path)
     
@@ -198,42 +207,81 @@ def load_json_files_from_folder(folder_path: str, progress: Optional[ProgressTra
         raise FileNotFoundError(f"Folder not found: {folder_path}")
     
     # Find all JSON files
-    json_files = sorted(folder.glob("*.json"))
+    all_json_files = sorted(folder.glob("*.json"))
+    
+    # Filter to only files starting with the specified prefix
+    if file_prefix:
+        json_files = [f for f in all_json_files if f.name.startswith(file_prefix)]
+        skipped_files = [f for f in all_json_files if not f.name.startswith(file_prefix)]
+        
+        logger.info(f"JSON file filter (prefix='{file_prefix}'):")
+        logger.info(f"  Total JSON files found: {len(all_json_files)}")
+        logger.info(f"  Matching files:         {len(json_files)}")
+        logger.info(f"  Skipped files:          {len(skipped_files)}")
+        
+        if skipped_files:
+            logger.info(f"  Skipped file names:")
+            for f in skipped_files[:10]:  # Show first 10 skipped files
+                logger.info(f"    - {f.name}")
+            if len(skipped_files) > 10:
+                logger.info(f"    ... and {len(skipped_files) - 10} more")
+    else:
+        json_files = all_json_files
+        logger.info(f"Found {len(json_files)} JSON file(s) (no prefix filter)")
     
     if not json_files:
-        raise FileNotFoundError(f"No JSON files found in: {folder_path}")
+        raise FileNotFoundError(
+            f"No JSON files starting with '{file_prefix}' found in: {folder_path}"
+        )
     
-    logger.info(f"Found {len(json_files)} JSON file(s) in {folder_path}:")
+    logger.info(f"\nLoading {len(json_files)} JSON file(s) from {folder_path}:")
     for f in json_files:
         logger.info(f"  - {f.name}")
     
     # Load and concatenate
     dfs = []
+    total_records = 0
+    
     for i, json_file in enumerate(json_files):
-        logger.info(f"  Loading: {json_file.name}")
-        df = pd.read_json(json_file)
-        logger.info(f"    → {len(df):,} records")
-        dfs.append(df)
+        logger.info(f"  Loading ({i+1}/{len(json_files)}): {json_file.name}")
+        
+        try:
+            df = pd.read_json(json_file)
+            record_count = len(df)
+            total_records += record_count
+            logger.info(f"    → {record_count:,} records")
+            dfs.append(df)
+        except Exception as e:
+            logger.error(f"    → Failed to load: {e}")
+            continue
         
         if progress:
             progress.update(i + 1)
     
+    if not dfs:
+        raise ValueError(f"No valid JSON files could be loaded from: {folder_path}")
+    
     # Concatenate all DataFrames
     combined_df = pd.concat(dfs, ignore_index=True)
-    logger.info(f"  Combined: {len(combined_df):,} total records")
+    logger.info(f"\n  Combined: {len(combined_df):,} total records from {len(dfs)} files")
     
     return combined_df
 
 
-def load_data(source_path: str, progress: Optional[ProgressTracker] = None) -> pd.DataFrame:
+def load_data(
+    source_path: str, 
+    file_prefix: str = JSON_FILE_PREFIX,
+    progress: Optional[ProgressTracker] = None
+) -> pd.DataFrame:
     """
     Load data from various sources:
     - S3 path (s3://...)
-    - Local folder (loads all JSON files)
+    - Local folder (loads all JSON files starting with prefix)
     - Local file (single JSON file)
     
     Args:
         source_path: Path to data source
+        file_prefix: For folders, only load files starting with this prefix
         progress: Optional progress tracker
         
     Returns:
@@ -243,6 +291,7 @@ def load_data(source_path: str, progress: Optional[ProgressTracker] = None) -> p
     if source_path.startswith('s3://'):
         import boto3
         import io
+        logger.info(f"Loading from S3: {source_path}")
         path = source_path.replace('s3://', '')
         bucket, key = path.split('/', 1)
         response = boto3.client('s3').get_object(Bucket=bucket, Key=key)
@@ -251,9 +300,9 @@ def load_data(source_path: str, progress: Optional[ProgressTracker] = None) -> p
     # Local path
     path = Path(source_path)
     
-    # If it's a directory, load all JSON files
+    # If it's a directory, load all matching JSON files
     if path.is_dir():
-        return load_json_files_from_folder(source_path, progress)
+        return load_json_files_from_folder(source_path, file_prefix=file_prefix, progress=progress)
     
     # If it's a single file
     if path.is_file():
@@ -281,7 +330,12 @@ def load_distance_data(distance_path: Optional[str]) -> Optional[pd.DataFrame]:
         return pd.read_csv(distance_path)
 
 
-def prepare_data(config: Config, data_folder: str = None, package_id_prefix: str = PACKAGE_ID_PREFIX):
+def prepare_data(
+    config: Config, 
+    data_folder: str = None, 
+    package_id_prefix: str = PACKAGE_ID_PREFIX,
+    json_file_prefix: str = JSON_FILE_PREFIX
+):
     """Load data and create H5 cache files directly to S3."""
     from data.data_preprocessor import PackageLifecyclePreprocessor
     from data.dataset import PackageLifecycleDataset
@@ -295,26 +349,30 @@ def prepare_data(config: Config, data_folder: str = None, package_id_prefix: str
     logger.info("=" * 70)
     logger.info("DATA PREPARATION")
     logger.info("=" * 70)
-    logger.info(f"  Data source:      {data_source}")
-    logger.info(f"  Distance file:    {config.data.distance_file}")
-    logger.info(f"  Cache dir:        {config.data.cache_dir}")
-    logger.info(f"  Package prefix:   {package_id_prefix}")
-    logger.info(f"  Progress file:    {progress.progress_file}")
+    logger.info(f"  Data source:       {data_source}")
+    logger.info(f"  JSON file prefix:  {json_file_prefix if json_file_prefix else 'ALL'}")
+    logger.info(f"  Package ID prefix: {package_id_prefix if package_id_prefix else 'ALL'}")
+    logger.info(f"  Distance file:     {config.data.distance_file}")
+    logger.info(f"  Cache dir:         {config.data.cache_dir}")
+    logger.info(f"  Progress file:     {progress.progress_file}")
     logger.info("=" * 70)
     
     # Load data (handles folder, single file, or S3)
     progress.set_stage("loading")
     logger.info(f"\nLoading data from: {data_source}")
-    df = load_data(data_source, progress)
+    df = load_data(data_source, file_prefix=json_file_prefix, progress=progress)
     logger.info(f"  Total samples loaded: {len(df):,}")
     
     # Filter by package_id prefix
-    progress.set_stage("filtering")
-    logger.info(f"\nFiltering data by package_id prefix...")
-    df = filter_by_package_id_prefix(df, prefix=package_id_prefix)
-    
-    if len(df) == 0:
-        raise ValueError(f"No records remaining after filtering by package_id prefix '{package_id_prefix}'")
+    if package_id_prefix:
+        progress.set_stage("filtering")
+        logger.info(f"\nFiltering data by package_id prefix...")
+        df = filter_by_package_id_prefix(df, prefix=package_id_prefix)
+        
+        if len(df) == 0:
+            raise ValueError(f"No records remaining after filtering by package_id prefix '{package_id_prefix}'")
+    else:
+        logger.info("\nSkipping package_id prefix filter (disabled)")
     
     # Load distance matrix
     distance_df = load_distance_data(config.data.distance_file)
@@ -451,26 +509,44 @@ def main():
         help=f'Package ID prefix to filter by (default: {PACKAGE_ID_PREFIX})'
     )
     parser.add_argument(
-        '--no-filter',
+        '--file-prefix',
+        type=str,
+        default=JSON_FILE_PREFIX,
+        help=f'JSON file name prefix to filter by (default: {JSON_FILE_PREFIX})'
+    )
+    parser.add_argument(
+        '--no-package-filter',
         action='store_true',
         help='Disable package_id prefix filtering'
+    )
+    parser.add_argument(
+        '--no-file-filter',
+        action='store_true',
+        help='Disable JSON file prefix filtering (load all .json files)'
     )
     args = parser.parse_args()
     
     logger.info("=" * 70)
     logger.info("H5 CACHE PREPARATION")
     logger.info("=" * 70)
-    logger.info(f"Config:         {args.config}")
-    logger.info(f"Data folder:    {args.data_folder}")
-    logger.info(f"Package prefix: {args.package_prefix if not args.no_filter else 'DISABLED'}")
+    logger.info(f"Config:          {args.config}")
+    logger.info(f"Data folder:     {args.data_folder}")
+    logger.info(f"File prefix:     {args.file_prefix if not args.no_file_filter else 'DISABLED (all .json)'}")
+    logger.info(f"Package prefix:  {args.package_prefix if not args.no_package_filter else 'DISABLED'}")
     
     config = Config.load(args.config)
     
-    # Determine prefix (None if filtering disabled)
-    prefix = None if args.no_filter else args.package_prefix
+    # Determine prefixes (None if filtering disabled)
+    package_prefix = None if args.no_package_filter else args.package_prefix
+    file_prefix = None if args.no_file_filter else args.file_prefix
     
     try:
-        prepare_data(config, data_folder=args.data_folder, package_id_prefix=prefix)
+        prepare_data(
+            config, 
+            data_folder=args.data_folder, 
+            package_id_prefix=package_prefix,
+            json_file_prefix=file_prefix
+        )
     except Exception as e:
         logger.error(f"Error: {e}")
         import traceback
