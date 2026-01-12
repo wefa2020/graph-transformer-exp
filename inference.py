@@ -21,7 +21,7 @@ from tqdm import tqdm
 
 from torch_geometric.data import Data, Batch
 
-from config import ModelConfig
+from config import Config
 from models.event_predictor import EventTimePredictor
 from data.data_preprocessor import PackageLifecyclePreprocessor
 from data.neptune_extractor import (
@@ -108,22 +108,33 @@ class EventTimeInference:
         if self.device.type == 'cuda':
             print(f"GPU: {torch.cuda.get_device_name(0)}")
         
+        # Load preprocessor
         print(f"Loading preprocessor from {preprocessor_path}")
         if not os.path.exists(preprocessor_path):
             raise FileNotFoundError(f"Preprocessor not found: {preprocessor_path}")
         self.preprocessor = PackageLifecyclePreprocessor.load(preprocessor_path)
         
+        # Load checkpoint
         print(f"Loading checkpoint from {checkpoint_path}")
         if not os.path.exists(checkpoint_path):
             raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
         self.checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
         
-        self.model_config = ModelConfig.from_dict(self.checkpoint['model_config'])
+        # Extract vocab_sizes and feature_dims from checkpoint
         self.vocab_sizes = self.checkpoint['vocab_sizes']
+        self.feature_dims = self.checkpoint['feature_dims']
+        
+        # Load full config from checkpoint
+        full_config = Config.from_dict(self.checkpoint['config'])
+        self.model_config = full_config.model  # Store for reference
         
         print("Initializing model...")
-        self.model = EventTimePredictor(self.model_config, self.vocab_sizes)
-        self.model = self.model.to(self.device)
+        self.model = EventTimePredictor.from_config(
+            config=full_config,
+            vocab_sizes=self.vocab_sizes,
+            feature_dims=self.feature_dims,
+            device=self.device,
+        )
         self.model.load_state_dict(self.checkpoint['model_state_dict'])
         self.model.eval()
         
@@ -137,6 +148,7 @@ class EventTimeInference:
                 else:
                     print(f"  {k}: {v}")
         
+        # Connect to Neptune
         print(f"Connecting to Neptune at {neptune_endpoint}")
         self.neptune_endpoint = neptune_endpoint
         self.extractor = NeptuneDataExtractor(

@@ -1,6 +1,6 @@
 import os
 import json
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field, asdict, fields
 from typing import Dict, Any, Optional, List
 from pathlib import Path
 
@@ -57,7 +57,17 @@ class ModelConfig:
     time2vec_dim:int = 64
     edge_time2vec_dim:int = 128
     
-  
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> 'ModelConfig':
+        """Create ModelConfig from dictionary, ignoring unknown keys."""
+        if d is None:
+            return cls()
+        # Get valid field names for this dataclass
+        valid_fields = {f.name for f in fields(cls)}
+        # Filter dictionary to only include valid fields
+        filtered = {k: v for k, v in d.items() if k in valid_fields}
+        return cls(**filtered)
+    
 @dataclass
 class TrainingConfig:
     """Training hyperparameters."""
