@@ -1,19 +1,19 @@
 {
-   "experiment_name": "causal-graph-transformer-time2vec",
+  "experiment_name": "causal-graph-transformer-time2vec",
   "s3_bucket": "graph-transformer-exp",
   "s3_experiment_dir": "s3://graph-transformer-exp/experiments/causal-time2vec-v1",
   
-  "data": {
-    "source_data": "s3://graph-transformer-exp/data/test.json",
-    "distance_file": "s3://graph-transformer-exp/data/location_distances_complete.csv",
-    "cache_dir": "s3://graph-transformer-exp/cache",
-    "preprocessor_path": "s3://graph-transformer-exp/cache/preprocessor.pkl",
-    "num_workers": 32,
+  "vocab": {
     "event_types": ["INDUCT", "EXIT", "LINEHAUL", "DELIVERY"],
-    "problem_types": ["NO_PROBLEM", "DAMAGED_LABEL", "WRONG_NODE", "DAMAGED_PACKAGE_REPAIRABLE", "DAMAGED_PACKAGE", "DAMAGED_ITEM", "CPT_EXPIRED", "UNSUPPORTED_HAZMAT", "PARTIAL_SHIPMENT",
-                       "EMPTY_SHIPMENT", "VAS_PRINT_LABEL", "COMPLETE_SHIPMENT", "CANCELLED", "RESERVATION_EXPIRED", "OVERWEIGHT", "CRUSHED_BOX", "REPACK", "HOLE_IN_BOX", "TAPE_ISSUE", 
-                       "NO_REPACK", "ITEMS_MISSING_FROM_BIN", "INCORRECT_DIMENSION", "PACKAGE_OPEN", "COMPLETE_REVERSE_SHIPMENT"],
-        "zip_codes": [
+    "problem_types": [
+      "NO_PROBLEM", "DAMAGED_LABEL", "WRONG_NODE", "DAMAGED_PACKAGE_REPAIRABLE",
+      "DAMAGED_PACKAGE", "DAMAGED_ITEM", "CPT_EXPIRED", "UNSUPPORTED_HAZMAT",
+      "PARTIAL_SHIPMENT", "EMPTY_SHIPMENT", "VAS_PRINT_LABEL", "COMPLETE_SHIPMENT",
+      "CANCELLED", "RESERVATION_EXPIRED", "OVERWEIGHT", "CRUSHED_BOX", "REPACK",
+      "HOLE_IN_BOX", "TAPE_ISSUE", "NO_REPACK", "ITEMS_MISSING_FROM_BIN",
+      "INCORRECT_DIMENSION", "PACKAGE_OPEN", "COMPLETE_REVERSE_SHIPMENT"
+    ],
+       "zip_codes": [
 "00501","00544","00601","00602","00603","00604","00605","00606","00610","00611","00612","00613","00614","00616","00617","00622","00623","00624","00627","00631",
 "00636","00637","00638","00641","00646","00647","00650","00652","00653","00656","00659","00660","00662","00664","00667","00669","00670","00674","00676","00677",
 "00678","00680","00681","00682","00683","00685","00687","00688","00690","00692","00693","00694","00698","00703","00704","00705","00707","00714","00715","00716",
@@ -2140,10 +2140,19 @@
 "99762","99763","99764","99765","99766","99767","99768","99769","99770","99771","99772","99773","99774","99775","99776","99777","99778","99779","99780","99781",
 "99782","99783","99784","99785","99786","99788","99789","99790","99791","99801","99802","99803","99811","99812","99820","99821","99824","99825","99826","99827",
 "99829","99830","99832","99833","99835","99836","99840","99841","99850","99901","99903","99918","99919","99921","99922","99923","99925","99926","99927","99928",
-"99929","99950"
+"99929","99950" 
 ]
-    },
-    "model": {
+  },
+  
+  "data": {
+    "source_data": "s3://graph-transformer-exp/data/test.json",
+    "distance_file": "s3://graph-transformer-exp/data/location_distances_complete.csv",
+    "cache_dir": "s3://graph-transformer-exp/cache",
+    "preprocessor_path": "s3://graph-transformer-exp/cache/preprocessor.pkl",
+    "num_workers": 32
+  },
+  
+  "model": {
     "hidden_dim": 512,
     "num_layers": 40,
     "num_heads": 8,

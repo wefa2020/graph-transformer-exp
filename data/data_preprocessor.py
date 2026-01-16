@@ -19,23 +19,13 @@ class PackageLifecyclePreprocessor:
     """
     Causal preprocessor for package lifecycle data with Time2Vec support.
     
-    Time Features Output:
-    - Raw time values for Time2Vec (hour, dow, dom, month, elapsed, time_delta)
-    - These are processed by the model's Time2Vec layers
-    
-    Feature Types:
-    1. OBSERVABLE features (known BEFORE event happens)
-    2. REALIZED features (only known AFTER event happens)
-    
-    Problem Handling:
-    - NEW FORMAT: Problems stored directly on INDUCT/LINEHAUL events
-    - OLD FORMAT: Problems stored on EXIT events (backward compatibility)
+    All vocabulary comes from config - no data collection during fit.
     """
     
     def __init__(self, config, distance_df: pd.DataFrame = None, distance_file_path: str = None):
         """
         Args:
-            config: Configuration object with data.event_types, data.problem_types, and data.zip_codes
+            config: Configuration object with data.vocab containing all vocabulary lists
             distance_df: Pre-loaded DataFrame with distance data
             distance_file_path: Path to location_distances_complete.csv
         """
@@ -61,17 +51,15 @@ class PackageLifecyclePreprocessor:
         # === Scalers for continuous features ===
         self.time_since_prev_scaler = StandardScaler()
         self.dwelling_time_scaler = StandardScaler()
-        self.time_delta_scaler = StandardScaler()  # For time_until_plan and time_vs_plan
+        self.time_delta_scaler = StandardScaler()
         self.elapsed_time_scaler = StandardScaler()
         self.edge_distance_scaler = StandardScaler()
         self.label_time_scaler = StandardScaler()
         self.package_feature_scaler = StandardScaler()
         
-        # Event and problem types from config
-        self.event_types = config.data.event_types
-        self.problem_types = config.data.problem_types
-        self.zip_codes = self._get_zip_codes_from_config(config)
-        self.problem_type_to_idx = {}
+        # === Get vocabulary from config ===
+        self.vocab = self._get_vocab_from_config(config)
+        self.problem_type_to_idx = {pt: idx for idx, pt in enumerate(self.vocab['problem_types'])}
         
         self.fitted = False
         self.vocab_sizes = {}
@@ -81,11 +69,56 @@ class PackageLifecyclePreprocessor:
         self.unknown_values = defaultdict(set)
         self.unknown_counts = defaultdict(int)
         
-        # === Feature dimensions (updated for Time2Vec) ===
-        # Observable: [time_features(6), is_delivery(1), position(1), has_plan(1)] = 9
-        # Realized: [time_features(6), time_since_prev(1), dwelling(2), missort(1), problem(1+N)] = 11 + N
-        self.observable_time_dim = 6  # hour, dow, dom, month, elapsed, time_until_plan
-        self.realized_time_dim = 6    # hour, dow, dom, month, elapsed, time_vs_plan
+        # === Feature dimensions ===
+        self.observable_time_dim = 6
+        self.realized_time_dim = 6
+    
+    def _get_vocab_from_config(self, config) -> Dict[str, List[str]]:
+        """Extract all vocabulary from config."""
+        vocab = {
+            'event_types': [],
+            'problem_types': [],
+            'zip_codes': [],
+            'locations': [],
+            'carriers': [],
+            'leg_types': [],
+            'ship_methods': [],
+            'regions': [],
+        }
+        
+        # Try new structure (config.data.vocab)
+        if hasattr(config, 'data') and hasattr(config.data, 'vocab'):
+            v = config.data.vocab
+            vocab['event_types'] = getattr(v, 'event_types', []) or []
+            vocab['problem_types'] = getattr(v, 'problem_types', []) or []
+            vocab['zip_codes'] = getattr(v, 'zip_codes', []) or []
+            vocab['locations'] = getattr(v, 'locations', []) or []
+            vocab['carriers'] = getattr(v, 'carriers', []) or []
+            vocab['leg_types'] = getattr(v, 'leg_types', []) or []
+            vocab['ship_methods'] = getattr(v, 'ship_methods', []) or []
+            vocab['regions'] = getattr(v, 'regions', []) or []
+        
+        # Fallback to old structure (config.data.event_types, etc.)
+        elif hasattr(config, 'data'):
+            vocab['event_types'] = getattr(config.data, 'event_types', []) or []
+            vocab['problem_types'] = getattr(config.data, 'problem_types', []) or []
+            vocab['zip_codes'] = getattr(config.data, 'zip_codes', []) or []
+            vocab['locations'] = getattr(config.data, 'locations', []) or []
+            vocab['carriers'] = getattr(config.data, 'carriers', []) or []
+            vocab['leg_types'] = getattr(config.data, 'leg_types', []) or []
+            vocab['ship_methods'] = getattr(config.data, 'ship_methods', []) or []
+            vocab['regions'] = getattr(config.data, 'regions', []) or []
+        
+        # Convert all to strings
+        for key in vocab:
+            vocab[key] = [str(v) for v in vocab[key]]
+        
+        # Print summary
+        print("=== Vocabulary from Config ===")
+        for name, values in vocab.items():
+            print(f"  {name}: {len(values)}")
+        
+        return vocab
     
     def enable_unknown_tracking(self, enable: bool = True):
         """Enable/disable tracking of unknown values."""
@@ -133,31 +166,6 @@ class PackageLifecyclePreprocessor:
                 print(f"    ... and {len(sorted_values) - 10} more")
         
         print("\n" + "=" * 70)
-    
-    def _get_zip_codes_from_config(self, config) -> List[str]:
-        """Extract zip_codes from config with multiple fallback options."""
-        zip_codes = []
-        
-        if hasattr(config, 'data'):
-            if hasattr(config.data, 'zip_codes'):
-                zip_codes = config.data.zip_codes
-            elif isinstance(config.data, dict) and 'zip_codes' in config.data:
-                zip_codes = config.data['zip_codes']
-        elif hasattr(config, 'zip_codes'):
-            zip_codes = config.zip_codes
-        elif isinstance(config, dict):
-            if 'data' in config and 'zip_codes' in config['data']:
-                zip_codes = config['data']['zip_codes']
-            elif 'zip_codes' in config:
-                zip_codes = config['zip_codes']
-        
-        if zip_codes:
-            zip_codes = [str(z) for z in zip_codes]
-            print(f"Loaded {len(zip_codes)} zip codes from config")
-        else:
-            print("Warning: No zip_codes found in config, will collect from data during fit()")
-        
-        return zip_codes
     
     # =========================================================================
     # DISTANCE DATA LOADING
@@ -341,7 +349,7 @@ class PackageLifecyclePreprocessor:
     
     def _encode_problems(self, problem_value) -> np.ndarray:
         """Create multi-hot encoding for problem types."""
-        encoding = np.zeros(len(self.problem_types), dtype=np.float32)
+        encoding = np.zeros(len(self.vocab['problem_types']), dtype=np.float32)
         problems = self._parse_problem_field(problem_value)
         
         if not problems:
@@ -375,34 +383,8 @@ class PackageLifecyclePreprocessor:
         
         return int(encoder.transform([value])[0])
     
-    def _extract_raw_time_features(self, dt: datetime, elapsed_hours: float, 
-                                    time_delta: float) -> np.ndarray:
-        """
-        Extract raw time features for Time2Vec.
-        
-        Args:
-            dt: The datetime to extract features from
-            elapsed_hours: Hours since journey start
-            time_delta: Time difference (until_plan or vs_plan) in hours
-        
-        Returns:
-            Array of [hour, dow, dom, month, elapsed, time_delta]
-        """
-        return np.array([
-            dt.hour + dt.minute / 60.0,  # Hour as float (0-24)
-            dt.weekday(),                 # Day of week (0-6)
-            dt.day,                       # Day of month (1-31)
-            dt.month,                     # Month (1-12)
-            elapsed_hours,                # Hours since first event
-            time_delta,                   # Time delta (scaled separately)
-        ], dtype=np.float32)
-    
     def _get_plan_time_for_event(self, event: Dict, prev_event: Dict = None) -> Optional[str]:
-        """
-        Get plan_time for an event.
-        - EXIT: use previous event's CPT (if INDUCT/LINEHAUL)
-        - Others: use own plan_time
-        """
+        """Get plan_time for an event."""
         event_type = str(event.get('event_type', ''))
         
         if event_type == 'EXIT' and prev_event is not None:
@@ -420,125 +402,67 @@ class PackageLifecyclePreprocessor:
     
     def _get_event_problem(self, event: Dict, events: List[Dict], 
                            event_idx: int) -> Tuple[np.ndarray, float]:
-        """
-        For INDUCT/LINEHAUL events, get problem encoding.
-        
-        Handles both data formats:
-        - NEW FORMAT: Problems are stored directly on INDUCT/LINEHAUL events
-        - OLD FORMAT: Problems are stored on EXIT events (backward compatibility)
-        
-        Logic:
-        1. If event is not INDUCT/LINEHAUL, return no problems
-        2. Check if INDUCT/LINEHAUL has problems directly → use them (new format)
-        3. Otherwise, look for corresponding EXIT and use its problems (old format)
-        
-        Returns:
-            Tuple of (problem_encoding, has_problem_flag)
-        """
+        """Get problem encoding for INDUCT/LINEHAUL events."""
         event_type = str(event.get('event_type', ''))
         
-        # Only process INDUCT and LINEHAUL events
         if event_type not in ['INDUCT', 'LINEHAUL']:
-            return np.zeros(len(self.problem_types), dtype=np.float32), 0.0
+            return np.zeros(len(self.vocab['problem_types']), dtype=np.float32), 0.0
         
-        # === STEP 1: Check if this event has problems directly (NEW FORMAT) ===
+        # Check direct problems (new format)
         direct_problems = self._parse_problem_field(event.get('problem'))
         if direct_problems:
-            # Problems found directly on INDUCT/LINEHAUL - use them
             encoding = self._encode_problems(event.get('problem'))
             return encoding, 1.0
         
-        # === STEP 2: Fallback to EXIT problems (OLD FORMAT) ===
+        # Fallback to EXIT problems (old format)
         current_sc = self._get_sort_center(event)
         if current_sc == 'UNKNOWN':
-            return np.zeros(len(self.problem_types), dtype=np.float32), 0.0
+            return np.zeros(len(self.vocab['problem_types']), dtype=np.float32), 0.0
         
-        # Look for next EXIT at same sort center
         for i in range(event_idx + 1, len(events)):
             next_event = events[i]
             next_type = str(next_event.get('event_type', ''))
             next_sc = self._get_sort_center(next_event)
             
             if next_type == 'EXIT' and next_sc == current_sc:
-                # Found corresponding EXIT event
                 exit_problems = self._parse_problem_field(next_event.get('problem'))
                 if exit_problems:
-                    # EXIT has problems - old format
                     encoding = self._encode_problems(next_event.get('problem'))
                     return encoding, 1.0
                 else:
-                    # EXIT exists but no problems
-                    return np.zeros(len(self.problem_types), dtype=np.float32), 0.0
+                    return np.zeros(len(self.vocab['problem_types']), dtype=np.float32), 0.0
             
-            # Stop searching if we've moved to a different sort center
             if next_sc != current_sc and next_sc != 'UNKNOWN':
                 break
         
-        # No problems found in either format
-        return np.zeros(len(self.problem_types), dtype=np.float32), 0.0
+        return np.zeros(len(self.vocab['problem_types']), dtype=np.float32), 0.0
     
     # =========================================================================
-    # FITTING
+    # FITTING (Uses Config Vocab - No Data Collection)
     # =========================================================================
     
     def fit(self, df: pd.DataFrame):
-        """Fit encoders and scalers on training data."""
+        """
+        Fit encoders and scalers on training data.
         
-        all_locations = set()
-        all_carriers = set()
-        all_leg_types = set()
-        all_ship_methods = set()
-        all_regions = set()
-        all_postals = set()
+        Encoders use vocabulary from config (no data collection).
+        Scalers are fitted on actual data values.
+        """
+        print("\n=== Fitting Preprocessor ===")
+        print("Using vocabulary from config (no data collection)")
         
-        if self.zip_codes:
-            all_postals.update(self.zip_codes)
-            print(f"Using {len(self.zip_codes)} postal codes from config.data.zip_codes")
-        else:
-            print("Collecting postal codes from data (no zip_codes in config)")
-            for _, row in df.iterrows():
-                source_postal = row.get('source_postal')
-                dest_postal = row.get('dest_postal')
-                if source_postal and str(source_postal) != 'nan':
-                    all_postals.add(str(source_postal))
-                if dest_postal and str(dest_postal) != 'nan':
-                    all_postals.add(str(dest_postal))
-                
-                events = row['events']
-                for event in events:
-                    postal = self._get_delivery_postal(event)
-                    if postal != 'UNKNOWN':
-                        all_postals.add(postal)
-        
-        all_regions.update(self.region_lookup.values())
-        
-        for _, row in df.iterrows():
-            events = row['events']
-            for event in events:
-                loc = self._get_location(event)
-                if loc != 'UNKNOWN':
-                    all_locations.add(loc)
-                    region = self._get_region(loc)
-                    if region != 'UNKNOWN':
-                        all_regions.add(region)
-                
-                if event.get('carrier_id'):
-                    all_carriers.add(str(event['carrier_id']))
-                if event.get('leg_type'):
-                    all_leg_types.add(str(event['leg_type']))
-                if event.get('ship_method'):
-                    all_ship_methods.add(str(event['ship_method']))
-        
-        # Fit encoders with special tokens (PAD=0, UNKNOWN=1)
+        # === Fit encoders using config vocabulary ===
         special = ['PAD', 'UNKNOWN']
-        self.event_type_encoder.fit(special + self.event_types)
-        self.location_encoder.fit(special + sorted(list(all_locations - {'UNKNOWN'})))
-        self.carrier_encoder.fit(special + sorted(list(all_carriers - {'UNKNOWN'})))
-        self.leg_type_encoder.fit(special + sorted(list(all_leg_types - {'UNKNOWN'})))
-        self.ship_method_encoder.fit(special + sorted(list(all_ship_methods - {'UNKNOWN'})))
-        self.postal_encoder.fit(special + sorted(list(all_postals - {'UNKNOWN'})))
-        self.region_encoder.fit(special + sorted(list(all_regions - {'UNKNOWN'})))
         
+        self.event_type_encoder.fit(special + self.vocab['event_types'])
+        self.location_encoder.fit(special + self.vocab['locations'])
+        self.carrier_encoder.fit(special + self.vocab['carriers'])
+        self.leg_type_encoder.fit(special + self.vocab['leg_types'])
+        self.ship_method_encoder.fit(special + self.vocab['ship_methods'])
+        self.postal_encoder.fit(special + self.vocab['zip_codes'])
+        self.region_encoder.fit(special + self.vocab['regions'])
+        
+        # Set vocab sizes
         self.vocab_sizes = {
             'event_type': len(self.event_type_encoder.classes_),
             'location': len(self.location_encoder.classes_),
@@ -549,17 +473,17 @@ class PackageLifecyclePreprocessor:
             'region': len(self.region_encoder.classes_),
         }
         
-        self.problem_type_to_idx = {pt: idx for idx, pt in enumerate(self.problem_types)}
-        
         print(f"\n=== Vocabulary Sizes ===")
         for name, size in self.vocab_sizes.items():
             print(f"  {name}: {size}")
-        print(f"  problem_types: {len(self.problem_types)}")
+        print(f"  problem_types: {len(self.vocab['problem_types'])}")
         
-        # Collect values for scalers
+        # === Fit scalers on actual data values ===
+        print("\nFitting scalers on data...")
+        
         time_since_prev_vals = []
         dwelling_vals = []
-        time_delta_vals = []  # Combined: time_until_plan and time_vs_plan
+        time_delta_vals = []
         elapsed_vals = []
         distance_vals = []
         label_vals = []
@@ -593,7 +517,7 @@ class PackageLifecyclePreprocessor:
                 dwelling = (event.get('dwelling_seconds', 0) or 0) / 3600
                 dwelling_vals.append([dwelling])
                 
-                # Time vs plan (realized)
+                # Time vs plan
                 plan_time = self._get_plan_time_for_event(event, prev_event)
                 plan_dt = self._parse_datetime(plan_time)
                 if plan_dt:
@@ -601,7 +525,7 @@ class PackageLifecyclePreprocessor:
                     time_vs_plan = max(-720, min(time_vs_plan, 720))
                     time_delta_vals.append([time_vs_plan])
                 
-                # Time until next plan (observable)
+                # Time until next plan
                 if i < len(events) - 1:
                     next_event = events[i + 1]
                     next_plan_time = self._get_plan_time_for_event(next_event, event)
@@ -611,7 +535,7 @@ class PackageLifecyclePreprocessor:
                         time_until_plan = max(-720, min(time_until_plan, 720))
                         time_delta_vals.append([time_until_plan])
                 
-                # Label (transit time)
+                # Label
                 if i < len(events) - 1:
                     next_time = self._parse_datetime(events[i+1]['event_time'])
                     if next_time:
@@ -667,28 +591,20 @@ class PackageLifecyclePreprocessor:
                 print(f"  {name}: mean={scaler.mean_[0]:.4f}, std={scaler.scale_[0]:.4f}")
     
     # =========================================================================
-    # FEATURE EXTRACTION
+    # FEATURE EXTRACTION (unchanged from original)
     # =========================================================================
     
     def _extract_observable_features(self, event: Dict, prev_event: Dict,
                                       reference_time: datetime,
                                       first_event_time: datetime,
                                       events: List[Dict], event_idx: int) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        Extract OBSERVABLE features for an event.
-        
-        Returns:
-            Tuple of (time_features, other_features)
-            - time_features: [6] for Time2Vec (hour, dow, dom, month, elapsed, time_until_plan)
-            - other_features: [3] (is_delivery, position, has_plan)
-        """
+        """Extract OBSERVABLE features for an event."""
         event_type = str(event.get('event_type', 'UNKNOWN'))
         num_events = len(events)
         
         plan_time = self._get_plan_time_for_event(event, prev_event)
         plan_dt = self._parse_datetime(plan_time)
         
-        # Calculate time until plan
         has_plan = 0.0
         time_until_plan = 0.0
         
@@ -697,29 +613,23 @@ class PackageLifecyclePreprocessor:
             time_until_plan = (plan_dt - reference_time).total_seconds() / 3600
             time_until_plan = max(-720, min(time_until_plan, 720))
         
-        # Scale time_until_plan
         time_until_plan_scaled = self.time_delta_scaler.transform([[time_until_plan]])[0, 0]
-        
-        # Calculate elapsed time
         elapsed_hours = (reference_time - first_event_time).total_seconds() / 3600 if reference_time else 0.0
         elapsed_scaled = self.elapsed_time_scaler.transform([[elapsed_hours]])[0, 0]
         
-        # Use plan_dt for time features if available, else reference_time
         time_ref = plan_dt if plan_dt else reference_time
         if time_ref is None:
             time_ref = first_event_time
         
-        # Raw time features for Time2Vec
         time_features = np.array([
-            time_ref.hour + time_ref.minute / 60.0,  # hour (0-24)
-            time_ref.weekday(),                       # day of week (0-6)
-            time_ref.day,                             # day of month (1-31)
-            time_ref.month,                           # month (1-12)
-            elapsed_scaled,                           # elapsed (scaled)
-            time_until_plan_scaled,                   # time until plan (scaled)
+            time_ref.hour + time_ref.minute / 60.0,
+            time_ref.weekday(),
+            time_ref.day,
+            time_ref.month,
+            elapsed_scaled,
+            time_until_plan_scaled,
         ], dtype=np.float32)
         
-        # Other observable features
         is_delivery = 1.0 if event_type == 'DELIVERY' else 0.0
         position = event_idx / max(1, num_events - 1)
         
@@ -735,29 +645,19 @@ class PackageLifecyclePreprocessor:
                                     prev_time: Optional[datetime],
                                     first_event_time: datetime,
                                     events: List[Dict], event_idx: int) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        Extract REALIZED features for an event.
-        
-        Returns:
-            Tuple of (time_features, other_features)
-            - time_features: [6] for Time2Vec (hour, dow, dom, month, elapsed, time_vs_plan)
-            - other_features: [4 + num_problems] (time_since_prev, dwelling, has_dwelling, missort, has_problem, problems...)
-        """
+        """Extract REALIZED features for an event."""
         event_type = str(event.get('event_type', ''))
         event_time = self._parse_datetime(event['event_time'])
         
-        # Time since previous
         time_since_prev_scaled = 0.0
         if prev_time and event_time:
             time_since_prev = (event_time - prev_time).total_seconds() / 3600
             time_since_prev_scaled = self.time_since_prev_scaler.transform([[time_since_prev]])[0, 0]
         
-        # Dwelling
         dwelling = (event.get('dwelling_seconds', 0) or 0) / 3600
         dwelling_scaled = self.dwelling_time_scaler.transform([[dwelling]])[0, 0]
         has_dwelling = 1.0 if dwelling > 0 else 0.0
         
-        # Time vs plan
         plan_time = self._get_plan_time_for_event(event, prev_event)
         plan_dt = self._parse_datetime(plan_time)
         time_vs_plan = 0.0
@@ -766,11 +666,9 @@ class PackageLifecyclePreprocessor:
             time_vs_plan = max(-720, min(time_vs_plan, 720))
         time_vs_plan_scaled = self.time_delta_scaler.transform([[time_vs_plan]])[0, 0]
         
-        # Elapsed time
         elapsed_hours = (event_time - first_event_time).total_seconds() / 3600 if event_time and first_event_time else 0.0
         elapsed_scaled = self.elapsed_time_scaler.transform([[elapsed_hours]])[0, 0]
         
-        # Raw time features for Time2Vec (using actual event time)
         if event_time:
             time_features = np.array([
                 event_time.hour + event_time.minute / 60.0,
@@ -783,15 +681,12 @@ class PackageLifecyclePreprocessor:
         else:
             time_features = np.zeros(6, dtype=np.float32)
         
-        # Missort
         missort = 0.0
         if event_type in ['INDUCT', 'LINEHAUL']:
             missort = float(event.get('missort', False))
         
-        # Problem encoding - handles both new and old data formats
         problem_encoding, has_problem = self._get_event_problem(event, events, event_idx)
         
-        # Other realized features
         other_features = np.concatenate([
             [time_since_prev_scaled],
             [dwelling_scaled],
@@ -819,16 +714,15 @@ class PackageLifecyclePreprocessor:
         cross_region = float(source_region != target_region and 
                             source_region != 'UNKNOWN' and target_region != 'UNKNOWN')
         
-        # Raw time features for edge (source time)
         edge_features = np.array([
             distance_scaled,
             float(has_distance),
             same_location,
             cross_region,
-            source_time.hour + source_time.minute / 60.0,  # hour
-            source_time.weekday(),                          # dow
-            source_time.day,                                # dom
-            source_time.month,                              # month
+            source_time.hour + source_time.minute / 60.0,
+            source_time.weekday(),
+            source_time.day,
+            source_time.month,
         ], dtype=np.float32)
         
         return edge_features
@@ -857,7 +751,6 @@ class PackageLifecyclePreprocessor:
         
         first_event_time = event_times[0]
         
-        # Feature arrays
         node_observable_time = []
         node_observable_other = []
         node_realized_time = []
@@ -874,21 +767,18 @@ class PackageLifecyclePreprocessor:
             prev_time = event_times[i-1] if i > 0 else None
             reference_time = prev_time if i > 0 else event_times[0]
             
-            # Observable features
             obs_time, obs_other = self._extract_observable_features(
                 event, prev_event, reference_time, first_event_time, events, i
             )
             node_observable_time.append(obs_time)
             node_observable_other.append(obs_other)
             
-            # Realized features
             real_time, real_other = self._extract_realized_features(
                 event, prev_event, prev_time, first_event_time, events, i
             )
             node_realized_time.append(real_time)
             node_realized_other.append(real_other)
             
-            # Categorical indices
             location = self._get_location(event)
             postal = self._get_delivery_postal(event)
             region = self._get_region(location)
@@ -915,7 +805,6 @@ class PackageLifecyclePreprocessor:
                 self._safe_encode(self.ship_method_encoder, event.get('ship_method'), 'ship_method')
             )
         
-        # Convert to arrays
         node_observable_time = np.array(node_observable_time, dtype=np.float32)
         node_observable_other = np.array(node_observable_other, dtype=np.float32)
         node_realized_time = np.array(node_realized_time, dtype=np.float32)
@@ -924,7 +813,6 @@ class PackageLifecyclePreprocessor:
         for key in node_categorical_indices:
             node_categorical_indices[key] = np.array(node_categorical_indices[key], dtype=np.int64)
         
-        # Package features
         package_features = np.array([
             package_data.get('weight', 0) or 0,
             package_data.get('length', 0) or 0,
@@ -933,7 +821,6 @@ class PackageLifecyclePreprocessor:
         ], dtype=np.float32).reshape(1, -1)
         package_features_scaled = self.package_feature_scaler.transform(package_features).flatten()
         
-        # Edge features
         edge_index = []
         edge_features = []
         
@@ -952,22 +839,13 @@ class PackageLifecyclePreprocessor:
             edge_features = np.zeros((0, 8), dtype=np.float32)
         
         result = {
-            # Time features (for Time2Vec)
-            'node_observable_time': node_observable_time,    # [num_nodes, 6]
-            'node_realized_time': node_realized_time,        # [num_nodes, 6]
-            
-            # Other features
-            'node_observable_other': node_observable_other,  # [num_nodes, 3]
-            'node_realized_other': node_realized_other,      # [num_nodes, 5 + num_problems]
-            
-            # Categorical indices
+            'node_observable_time': node_observable_time,
+            'node_realized_time': node_realized_time,
+            'node_observable_other': node_observable_other,
+            'node_realized_other': node_realized_other,
             'node_categorical_indices': node_categorical_indices,
-            
-            # Edge features
             'edge_index': edge_index,
             'edge_features': edge_features,
-            
-            # Package features
             'package_features': package_features_scaled,
             'package_categorical': {
                 'source_postal': self._safe_encode(
@@ -977,8 +855,6 @@ class PackageLifecyclePreprocessor:
                     self.postal_encoder, package_data.get('dest_postal'), 'dest_postal'
                 ),
             },
-            
-            # Metadata
             'num_nodes': num_events,
             'package_id': package_data.get('package_id', 'unknown'),
         }
@@ -1031,10 +907,10 @@ class PackageLifecyclePreprocessor:
             'observable_time_dim': 6,
             'observable_other_dim': 3,
             'realized_time_dim': 6,
-            'realized_other_dim': 5 + len(self.problem_types),
+            'realized_other_dim': 5 + len(self.vocab['problem_types']),
             'edge_dim': 8,
             'package_dim': 4,
-            'num_problem_types': len(self.problem_types),
+            'num_problem_types': len(self.vocab['problem_types']),
         }
     
     def get_vocab_sizes(self) -> Dict[str, int]:
@@ -1049,7 +925,7 @@ class PackageLifecyclePreprocessor:
         """Get the list of zip codes used."""
         if self.fitted:
             return [c for c in self.postal_encoder.classes_ if c not in ['PAD', 'UNKNOWN']]
-        return self.zip_codes.copy()
+        return self.vocab['zip_codes'].copy()
     
     # =========================================================================
     # SAVE / LOAD

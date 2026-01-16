@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
 train_distributed.py - Distributed training for Causal Graph Transformer
+with Shared Memory support for maximum GPU utilization
 """
 
 import os
@@ -12,11 +13,13 @@ import time
 from datetime import timedelta
 from contextlib import nullcontext
 import logging
+from typing import Optional, Dict, Tuple
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.distributed as dist
+import torch.multiprocessing as mp
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
@@ -24,6 +27,24 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 
 from config import Config
+
+
+# =============================================================================
+# MULTIPROCESSING SETUP (MUST BE FIRST)
+# =============================================================================
+
+def setup_multiprocessing():
+    """
+    Set multiprocessing start method to 'fork' for shared memory inheritance.
+    Must be called before any multiprocessing operations.
+    """
+    try:
+        mp.set_start_method('fork', force=True)
+    except RuntimeError:
+        pass
+
+
+setup_multiprocessing()
 
 
 # =============================================================================
@@ -52,6 +73,10 @@ class RankLogger:
     
     def error(self, msg):
         self._logger.error(f"[Rank {self.rank}] {msg}")
+    
+    def debug(self, msg):
+        if self.rank == 0:
+            self._logger.debug(msg)
 
 
 def get_logger(rank: int) -> RankLogger:
@@ -59,55 +84,11 @@ def get_logger(rank: int) -> RankLogger:
 
 
 # =============================================================================
-# S3 UTILITIES
-# =============================================================================
-
-def upload_to_s3(local_path: str, s3_path: str, log: RankLogger = None):
-    """Upload a file to S3."""
-    import boto3
-    from botocore.exceptions import ClientError
-    
-    try:
-        s3_path_clean = s3_path.replace('s3://', '')
-        bucket, key = s3_path_clean.split('/', 1)
-        
-        boto3.client('s3').upload_file(local_path, bucket, key)
-        
-        if log:
-            log.info(f"Uploaded {local_path} to {s3_path}")
-        return True
-    except ClientError as e:
-        if log:
-            log.error(f"Failed to upload {local_path} to {s3_path}: {e}")
-        return False
-
-
-def upload_dict_to_s3(data: dict, s3_path: str, log: RankLogger = None):
-    """Upload a dict as JSON to S3."""
-    import boto3
-    from botocore.exceptions import ClientError
-    
-    try:
-        s3_path_clean = s3_path.replace('s3://', '')
-        bucket, key = s3_path_clean.split('/', 1)
-        
-        json_bytes = json.dumps(data, indent=2).encode('utf-8')
-        boto3.client('s3').put_object(Bucket=bucket, Key=key, Body=json_bytes)
-        
-        if log:
-            log.info(f"Uploaded JSON to {s3_path}")
-        return True
-    except ClientError as e:
-        if log:
-            log.error(f"Failed to upload to {s3_path}: {e}")
-        return False
-
-
-# =============================================================================
 # DISTRIBUTED SETUP
 # =============================================================================
 
 def setup_distributed():
+    """Setup distributed training environment."""
     env_vars = {
         "FI_EFA_USE_DEVICE_RDMA": "1",
         "FI_PROVIDER": "efa",
@@ -145,6 +126,7 @@ def setup_distributed():
 
 
 def sync_barrier(device: torch.device):
+    """Synchronize all distributed processes."""
     if dist.is_initialized():
         dist.barrier()
         dummy = torch.zeros(1, device=device)
@@ -154,6 +136,7 @@ def sync_barrier(device: torch.device):
 
 
 def cleanup_distributed():
+    """Cleanup distributed training."""
     if dist.is_initialized():
         dist.destroy_process_group()
 
@@ -163,15 +146,18 @@ def cleanup_distributed():
 # =============================================================================
 
 def set_seed(seed: int, rank: int = 0):
+    """Set random seeds for reproducibility."""
     actual_seed = seed + rank
     torch.manual_seed(actual_seed)
     torch.cuda.manual_seed_all(actual_seed)
     np.random.seed(actual_seed)
     torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.benchmark = True
 
 
 class GracefulShutdown:
+    """Handle graceful shutdown on signals."""
+    
     def __init__(self):
         self.should_stop = False
         signal.signal(signal.SIGTERM, self._handler)
@@ -183,6 +169,8 @@ class GracefulShutdown:
 
 
 class EarlyStopping:
+    """Early stopping to prevent overfitting."""
+    
     def __init__(self, patience: int = 10, min_delta: float = 1e-4):
         self.patience = patience
         self.min_delta = min_delta
@@ -203,12 +191,26 @@ class EarlyStopping:
         return self.should_stop
 
 
+def get_optimal_num_workers(world_size: int, local_rank: int) -> int:
+    """Calculate optimal number of DataLoader workers."""
+    cpu_count = os.cpu_count() or 8
+    gpus_per_node = torch.cuda.device_count() if torch.cuda.is_available() else 1
+    workers_per_gpu = max(4, cpu_count // gpus_per_node)
+    return min(workers_per_gpu, 16)
+
+
 # =============================================================================
-# DATA LOADING
+# DATA LOADING WITH SHARED MEMORY
 # =============================================================================
 
-def load_data(config: Config, rank: int, local_rank: int, world_size: int, log: RankLogger):
-    """Load datasets and preprocessor from S3."""
+def load_data_shared_memory(
+    config: Config, 
+    rank: int, 
+    local_rank: int, 
+    world_size: int, 
+    log: RankLogger
+) -> Tuple:
+    """Load datasets into shared memory for fast multi-worker access."""
     import boto3
     from data.data_preprocessor import PackageLifecyclePreprocessor
     from data.dataset import PackageLifecycleDataset
@@ -217,7 +219,7 @@ def load_data(config: Config, rank: int, local_rank: int, world_size: int, log: 
     
     if rank == 0:
         log.info("=" * 60)
-        log.info("LOADING DATA")
+        log.info("LOADING DATA INTO SHARED MEMORY")
         log.info("=" * 60)
         log.info(f"  Train: {config.data.train_h5}")
         log.info(f"  Val:   {config.data.val_h5}")
@@ -227,10 +229,13 @@ def load_data(config: Config, rank: int, local_rank: int, world_size: int, log: 
     
     log_fn = log.info if rank == 0 else None
     
+    start_time = time.time()
+    
     train_dataset = PackageLifecycleDataset(
         h5_cache_path=config.data.train_h5,
         load_from_cache=True,
         save_to_cache=False,
+        use_shared_memory=True,
         log_fn=log_fn
     )
     
@@ -238,6 +243,7 @@ def load_data(config: Config, rank: int, local_rank: int, world_size: int, log: 
         h5_cache_path=config.data.val_h5,
         load_from_cache=True,
         save_to_cache=False,
+        use_shared_memory=True,
         log_fn=log_fn
     )
     
@@ -245,8 +251,20 @@ def load_data(config: Config, rank: int, local_rank: int, world_size: int, log: 
         h5_cache_path=config.data.test_h5,
         load_from_cache=True,
         save_to_cache=False,
+        use_shared_memory=True,
         log_fn=log_fn
     )
+    
+    load_time = time.time() - start_time
+    
+    if rank == 0:
+        total_memory_mb = 0
+        for ds in [train_dataset, val_dataset, test_dataset]:
+            if ds._shared_data is not None:
+                total_memory_mb += ds._shared_data.estimate_memory_mb()
+        
+        log.info(f"  Total shared memory usage: {total_memory_mb:.1f} MB")
+        log.info(f"  Data loading time: {load_time:.1f}s")
     
     # Load preprocessor
     model_dir = os.environ.get('SM_MODEL_DIR', '/opt/ml/model')
@@ -263,45 +281,88 @@ def load_data(config: Config, rank: int, local_rank: int, world_size: int, log: 
     sync_barrier(device)
     
     if rank == 0:
-        log.info(f"  Loaded: Train={len(train_dataset)}, Val={len(val_dataset)}, Test={len(test_dataset)}")
+        log.info(f"  Samples: Train={len(train_dataset):,}, Val={len(val_dataset):,}, Test={len(test_dataset):,}")
         log.info("=" * 60)
     
     return train_dataset, val_dataset, test_dataset, preprocessor
 
 
-def create_dataloaders(train_dataset, val_dataset, test_dataset, config: Config, rank: int, world_size: int):
+def create_dataloaders(
+    train_dataset, 
+    val_dataset, 
+    test_dataset, 
+    config: Config, 
+    rank: int, 
+    local_rank: int,
+    world_size: int
+) -> Tuple:
+    """Create DataLoaders optimized for shared memory."""
     log = get_logger(rank)
-    batch_size = config.training.batch_size
-    num_workers = config.data.num_workers
     
-    train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True) if world_size > 1 else None
-    val_sampler = DistributedSampler(val_dataset, num_replicas=world_size, rank=rank, shuffle=False) if world_size > 1 else None
-    test_sampler = DistributedSampler(test_dataset, num_replicas=world_size, rank=rank, shuffle=False) if world_size > 1 else None
+    batch_size = config.training.batch_size
+    num_workers = get_optimal_num_workers(world_size, local_rank)
+    
+    if hasattr(config.data, 'num_workers') and config.data.num_workers > 0:
+        num_workers = config.data.num_workers
+    
+    log.info(f"  DataLoader workers per GPU: {num_workers}")
+    
+    train_sampler = DistributedSampler(
+        train_dataset, num_replicas=world_size, rank=rank, shuffle=True
+    ) if world_size > 1 else None
+    
+    val_sampler = DistributedSampler(
+        val_dataset, num_replicas=world_size, rank=rank, shuffle=False
+    ) if world_size > 1 else None
+    
+    test_sampler = DistributedSampler(
+        test_dataset, num_replicas=world_size, rank=rank, shuffle=False
+    ) if world_size > 1 else None
     
     train_loader = DataLoader(
-        train_dataset, batch_size=batch_size, sampler=train_sampler,
-        shuffle=(train_sampler is None), drop_last=True,
+        train_dataset,
+        batch_size=batch_size,
+        sampler=train_sampler,
+        shuffle=(train_sampler is None),
+        drop_last=True,
         collate_fn=train_dataset.get_collate_fn(),
-        num_workers=num_workers, pin_memory=True,
-        persistent_workers=num_workers > 0,
-        prefetch_factor=2 if num_workers > 0 else None,
+        num_workers=num_workers,
+        pin_memory=True,
+        persistent_workers=True,
+        prefetch_factor=4,
+        multiprocessing_context='fork'
     )
     
     val_loader = DataLoader(
-        val_dataset, batch_size=batch_size, sampler=val_sampler,
-        shuffle=False, drop_last=False,
+        val_dataset,
+        batch_size=batch_size,
+        sampler=val_sampler,
+        shuffle=False,
+        drop_last=False,
         collate_fn=val_dataset.get_collate_fn(),
-        num_workers=num_workers, pin_memory=True,
+        num_workers=num_workers,
+        pin_memory=True,
+        persistent_workers=True,
+        prefetch_factor=2,
+        multiprocessing_context='fork'
     )
     
     test_loader = DataLoader(
-        test_dataset, batch_size=batch_size, sampler=test_sampler,
-        shuffle=False, drop_last=False,
+        test_dataset,
+        batch_size=batch_size,
+        sampler=test_sampler,
+        shuffle=False,
+        drop_last=False,
         collate_fn=test_dataset.get_collate_fn(),
-        num_workers=num_workers, pin_memory=True,
+        num_workers=num_workers,
+        pin_memory=True,
+        persistent_workers=True,
+        prefetch_factor=2,
+        multiprocessing_context='fork'
     )
     
-    log.info(f"DataLoaders: Train={len(train_loader)}, Val={len(val_loader)}, Test={len(test_loader)}")
+    log.info(f"  DataLoaders: Train={len(train_loader)}, Val={len(val_loader)}, Test={len(test_loader)}")
+    log.info(f"  Batch size: {batch_size}, Workers: {num_workers}, Prefetch: 4")
     
     return train_loader, val_loader, test_loader, train_sampler
 
@@ -310,7 +371,14 @@ def create_dataloaders(train_dataset, val_dataset, test_dataset, config: Config,
 # MODEL
 # =============================================================================
 
-def create_model(preprocessor, config: Config, device, local_rank: int, world_size: int, rank: int):
+def create_model(
+    preprocessor, 
+    config: Config, 
+    device: torch.device, 
+    local_rank: int, 
+    world_size: int, 
+    rank: int
+) -> Tuple:
     """Create the Causal Graph Transformer model."""
     from models.event_predictor import EventTimePredictor
     
@@ -331,11 +399,14 @@ def create_model(preprocessor, config: Config, device, local_rank: int, world_si
     
     if world_size > 1:
         model = DDP(
-            model, device_ids=[local_rank], output_device=local_rank,
+            model, 
+            device_ids=[local_rank], 
+            output_device=local_rank,
             find_unused_parameters=config.distributed.find_unused_parameters,
-            gradient_as_bucket_view=True
+            gradient_as_bucket_view=True,
+            static_graph=True
         )
-        log.info("Model wrapped with DDP")
+        log.info("Model wrapped with DDP (static_graph=True)")
     
     return model, vocab_sizes, feature_dims
 
@@ -344,7 +415,7 @@ def create_model(preprocessor, config: Config, device, local_rank: int, world_si
 # METRICS
 # =============================================================================
 
-def compute_metrics(preds, targets):
+def compute_metrics(preds: np.ndarray, targets: np.ndarray) -> Dict[str, float]:
     """Compute regression metrics."""
     preds = np.asarray(preds).flatten()
     targets = np.asarray(targets).flatten()
@@ -365,10 +436,11 @@ def compute_metrics(preds, targets):
     return {'mae': mae, 'rmse': rmse, 'mape': mape, 'r2': r2}
 
 
-def reduce_metrics(metrics, device, world_size):
+def reduce_metrics(metrics: Dict, device: torch.device, world_size: int) -> Dict:
     """Reduce metrics across distributed workers."""
     if world_size <= 1:
         return metrics
+    
     reduced = {}
     for k, v in metrics.items():
         if isinstance(v, (int, float)):
@@ -381,16 +453,15 @@ def reduce_metrics(metrics, device, world_size):
 
 
 # =============================================================================
-# CHECKPOINTING WITH S3 UPLOAD
+# CHECKPOINTING
 # =============================================================================
 
 def save_checkpoint(
-    model, optimizer, scheduler, epoch, metrics, 
-    vocab_sizes, feature_dims, config: Config, 
-    local_path: str, s3_path: str = None,
-    is_best: bool = False, log: RankLogger = None
+    model, optimizer, scheduler, epoch: int, metrics: Dict,
+    vocab_sizes: Dict, feature_dims: Dict, config: Config,
+    local_path: str, is_best: bool = False
 ):
-    """Save checkpoint locally and optionally upload to S3."""
+    """Save checkpoint locally."""
     model_to_save = model.module if hasattr(model, 'module') else model
     
     checkpoint = {
@@ -406,26 +477,34 @@ def save_checkpoint(
         'is_best': is_best
     }
     
-    # Save locally
     temp_path = local_path + '.tmp'
     torch.save(checkpoint, temp_path)
     os.replace(temp_path, local_path)
-    
-    # Upload to S3 if path provided
-    if s3_path:
-        upload_to_s3(local_path, s3_path, log)
 
 
 # =============================================================================
-# TRAINING
+# TRAINING LOOP
 # =============================================================================
 
-def train_epoch(model, loader, optimizer, criterion, device, preprocessor, config: Config,
-                rank: int, world_size: int, epoch: int):
+def train_epoch(
+    model, 
+    loader, 
+    optimizer, 
+    criterion, 
+    device: torch.device, 
+    preprocessor,
+    config: Config,
+    rank: int, 
+    world_size: int, 
+    epoch: int
+) -> Dict[str, float]:
     """Train for one epoch."""
     model.train()
-    total_loss, total_samples = 0.0, 0
-    all_preds, all_targets = [], []
+    
+    total_loss = 0.0
+    total_samples = 0
+    all_preds = []
+    all_targets = []
     num_optimizer_steps = 0
     skipped_batches = 0
     
@@ -439,12 +518,24 @@ def train_epoch(model, loader, optimizer, criterion, device, preprocessor, confi
     if num_batches == 0:
         return {'loss': 0.0, 'mae': 0.0, 'rmse': 0.0, 'mape': 0.0, 'r2': 0.0, 'num_optimizer_steps': 0}
     
-    optimizer.zero_grad()
+    optimizer.zero_grad(set_to_none=True)
     accumulated_loss = 0.0
     accumulated_samples = 0
     
+    batch_times = []
+    data_times = []
+    compute_times = []
+    
+    data_start = time.time()
+    
     for batch_idx, batch in enumerate(loader):
+        data_time = time.time() - data_start
+        data_times.append(data_time)
+        
+        compute_start = time.time()
+        
         batch = batch.to(device, non_blocking=True)
+        
         should_sync = (batch_idx + 1) % grad_accum == 0 or (batch_idx + 1) == num_batches
         ctx = model.no_sync() if (is_ddp and not should_sync) else nullcontext()
         
@@ -458,6 +549,7 @@ def train_epoch(model, loader, optimizer, criterion, device, preprocessor, confi
                 
                 if preds_flat.numel() == 0:
                     skipped_batches += 1
+                    data_start = time.time()
                     continue
                 
                 min_len = min(len(preds_flat), len(labels_flat))
@@ -465,12 +557,14 @@ def train_epoch(model, loader, optimizer, criterion, device, preprocessor, confi
                 
                 if torch.isnan(preds_flat).any() or torch.isinf(preds_flat).any():
                     skipped_batches += 1
+                    data_start = time.time()
                     continue
                 
                 loss = criterion(preds_flat.float(), labels_flat.float())
                 
                 if torch.isnan(loss) or torch.isinf(loss):
                     skipped_batches += 1
+                    data_start = time.time()
                     continue
                 
                 scaled_loss = loss / grad_accum
@@ -481,8 +575,12 @@ def train_epoch(model, loader, optimizer, criterion, device, preprocessor, confi
         accumulated_loss += loss.item() * bs
         accumulated_samples += bs
         
-        all_preds.append(preprocessor.inverse_transform_time(preds_flat.detach().float().cpu().numpy()))
-        all_targets.append(preprocessor.inverse_transform_time(labels_flat.float().cpu().numpy()))
+        all_preds.append(preprocessor.inverse_transform_time(
+            preds_flat.detach().float().cpu().numpy()
+        ))
+        all_targets.append(preprocessor.inverse_transform_time(
+            labels_flat.float().cpu().numpy()
+        ))
         
         if should_sync:
             grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
@@ -491,11 +589,31 @@ def train_epoch(model, loader, optimizer, criterion, device, preprocessor, confi
                 optimizer.step()
                 num_optimizer_steps += 1
             
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
             total_loss += accumulated_loss
             total_samples += accumulated_samples
             accumulated_loss = 0.0
             accumulated_samples = 0
+        
+        compute_time = time.time() - compute_start
+        compute_times.append(compute_time)
+        batch_times.append(data_time + compute_time)
+        
+        # Log progress
+        if rank == 0 and (batch_idx + 1) % 100 == 0:
+            avg_batch_time = np.mean(batch_times[-100:])
+            avg_data_time = np.mean(data_times[-100:])
+            avg_compute_time = np.mean(compute_times[-100:])
+            throughput = bs / avg_batch_time if avg_batch_time > 0 else 0
+            
+            logging.info(
+                f"  Batch {batch_idx + 1}/{num_batches} | "
+                f"Throughput: {throughput:.0f} samples/s | "
+                f"Data: {avg_data_time*1000:.1f}ms | "
+                f"Compute: {avg_compute_time*1000:.1f}ms"
+            )
+        
+        data_start = time.time()
     
     if accumulated_samples > 0:
         total_loss += accumulated_loss
@@ -508,15 +626,30 @@ def train_epoch(model, loader, optimizer, criterion, device, preprocessor, confi
     metrics['loss'] = total_loss / total_samples
     metrics['num_optimizer_steps'] = num_optimizer_steps
     metrics['skipped_batches'] = skipped_batches
+    metrics['avg_batch_time_ms'] = np.mean(batch_times) * 1000 if batch_times else 0
+    metrics['avg_data_time_ms'] = np.mean(data_times) * 1000 if data_times else 0
+    metrics['avg_compute_time_ms'] = np.mean(compute_times) * 1000 if compute_times else 0
+    metrics['throughput'] = total_samples / sum(batch_times) if batch_times else 0
+    
     return metrics
 
 
 @torch.no_grad()
-def validate(model, loader, criterion, device, preprocessor, use_amp: bool = True):
+def validate(
+    model, 
+    loader, 
+    criterion, 
+    device: torch.device, 
+    preprocessor, 
+    use_amp: bool = True
+) -> Dict[str, float]:
     """Validate model."""
     model.eval()
-    total_loss, total_samples = 0.0, 0
-    all_preds, all_targets = [], []
+    
+    total_loss = 0.0
+    total_samples = 0
+    all_preds = []
+    all_targets = []
     
     for batch in loader:
         batch = batch.to(device, non_blocking=True)
@@ -562,23 +695,15 @@ def validate(model, loader, criterion, device, preprocessor, use_amp: bool = Tru
 # =============================================================================
 
 def main():
-    # Get config path from hyperparameters
     config_path = os.environ.get('SM_HP_CONFIG_PATH', 's3://graph-transformer-exp/configs/config.json')
     model_dir = os.environ.get('SM_MODEL_DIR', '/opt/ml/model')
     
-    # Setup distributed
     rank, local_rank, world_size = setup_distributed()
     device = torch.device(f'cuda:{local_rank}')
     log = get_logger(rank)
     
-    # Load config from S3
     log.info(f"Loading config from: {config_path}")
     config = Config.load(config_path)
-    
-    # S3 output paths
-    s3_output_dir = config.s3_experiment_dir
-    s3_best_model = f"{s3_output_dir}/best_model.pt"
-    s3_results = f"{s3_output_dir}/results.json"
     
     set_seed(config.training.seed, rank)
     shutdown = GracefulShutdown()
@@ -590,18 +715,23 @@ def main():
     log.info(f"  Epochs: {config.training.epochs}, Batch size: {config.training.batch_size}")
     log.info(f"  LR: {config.training.learning_rate}, Hidden dim: {config.model.hidden_dim}")
     log.info(f"  Layers: {config.model.num_layers}, Heads: {config.model.num_heads}")
-    log.info(f"  S3 Output: {s3_output_dir}")
+    log.info(f"  Shared Memory: ENABLED")
     log.info("=" * 70)
     
+    train_ds, val_ds, test_ds = None, None, None
+    
     try:
-        # Load data
-        train_ds, val_ds, test_ds, preprocessor = load_data(config, rank, local_rank, world_size, log)
+        # Load data into shared memory
+        train_ds, val_ds, test_ds, preprocessor = load_data_shared_memory(
+            config, rank, local_rank, world_size, log
+        )
+        
         gc.collect()
         torch.cuda.empty_cache()
         
         # Create dataloaders
         train_loader, val_loader, test_loader, train_sampler = create_dataloaders(
-            train_ds, val_ds, test_ds, config, rank, world_size
+            train_ds, val_ds, test_ds, config, rank, local_rank, world_size
         )
         
         # Create model
@@ -614,33 +744,37 @@ def main():
             params = m.get_num_parameters()
             log.info(f"Parameters: {params['total']:,} total, {params['trainable']:,} trainable")
         
-        # Optimizer
+        # Optimizer & Scheduler
         optimizer = AdamW(
             model.parameters(),
             lr=config.training.learning_rate,
             weight_decay=config.training.weight_decay,
-            eps=1e-8
+            eps=1e-8,
+            fused=True
         )
         
-        # Loss function
         criterion = nn.MSELoss()
         
-        # Early stopping
         early_stopping = EarlyStopping(
             patience=config.training.patience,
             min_delta=config.training.min_delta
         )
         
-        # Scheduler
         warmup_epochs = config.training.warmup_epochs
         if warmup_epochs > 0:
-            warmup_scheduler = LinearLR(optimizer, start_factor=0.01, end_factor=1.0, total_iters=warmup_epochs)
+            warmup_scheduler = LinearLR(
+                optimizer, start_factor=0.01, end_factor=1.0, total_iters=warmup_epochs
+            )
             main_scheduler = CosineAnnealingLR(
                 optimizer,
                 T_max=config.training.epochs - warmup_epochs,
                 eta_min=config.training.learning_rate * config.training.min_lr_ratio
             )
-            scheduler = SequentialLR(optimizer, schedulers=[warmup_scheduler, main_scheduler], milestones=[warmup_epochs])
+            scheduler = SequentialLR(
+                optimizer, 
+                schedulers=[warmup_scheduler, main_scheduler], 
+                milestones=[warmup_epochs]
+            )
         else:
             scheduler = CosineAnnealingLR(
                 optimizer,
@@ -653,9 +787,10 @@ def main():
         best_epoch = 0
         
         log.info("=" * 70)
-        log.info("TRAINING LOOP")
+        log.info("TRAINING LOOP (Shared Memory Mode)")
         log.info("=" * 70)
         
+        # Training Loop
         for epoch in range(1, config.training.epochs + 1):
             if shutdown.should_stop:
                 log.info("Shutdown requested")
@@ -667,16 +802,19 @@ def main():
             
             # Train
             train_metrics = train_epoch(
-                model, train_loader, optimizer, criterion, device, preprocessor, config, rank, world_size, epoch
+                model, train_loader, optimizer, criterion, device, 
+                preprocessor, config, rank, world_size, epoch
             )
             sync_barrier(device)
             
             # Validate
-            val_metrics = validate(model, val_loader, criterion, device, preprocessor, config.training.use_amp)
+            val_metrics = validate(
+                model, val_loader, criterion, device, preprocessor, config.training.use_amp
+            )
             
             scheduler.step()
             
-            # Reduce metrics
+            # Reduce metrics across workers
             if world_size > 1:
                 train_metrics = reduce_metrics(train_metrics, device, world_size)
                 val_metrics = reduce_metrics(val_metrics, device, world_size)
@@ -684,19 +822,22 @@ def main():
             epoch_time = time.time() - epoch_start
             current_lr = scheduler.get_last_lr()[0]
             
-            log.info(f"Epoch {epoch}/{config.training.epochs} | Time: {epoch_time:.1f}s | LR: {current_lr:.2e}")
+            # Logging
+            log.info(f"\nEpoch {epoch}/{config.training.epochs} | Time: {epoch_time:.1f}s | LR: {current_lr:.2e}")
             log.info(f"  Train - Loss: {train_metrics['loss']:.4f}, MAE: {train_metrics['mae']:.2f}h, R²: {train_metrics['r2']:.4f}")
             log.info(f"  Val   - Loss: {val_metrics['loss']:.4f}, MAE: {val_metrics['mae']:.2f}h, R²: {val_metrics['r2']:.4f}")
+            log.info(f"  Throughput: {train_metrics.get('throughput', 0):.0f} samples/s | "
+                    f"Data: {train_metrics.get('avg_data_time_ms', 0):.1f}ms | "
+                    f"Compute: {train_metrics.get('avg_compute_time_ms', 0):.1f}ms")
             
             if train_metrics.get('skipped_batches', 0) > 0:
                 log.warning(f"  Skipped {train_metrics['skipped_batches']} batches due to NaN/Inf")
             
-            # Save checkpoints (rank 0 only)
+            # Save best model (rank 0 only)
             if rank == 0:
                 val_loss = val_metrics['loss']
                 val_mae = val_metrics['mae']
                 
-                # Save best model
                 if val_loss < float('inf') and val_loss < best_val_loss:
                     best_val_loss = val_loss
                     best_val_mae = val_mae
@@ -708,26 +849,9 @@ def main():
                         {'val_loss': val_loss, 'val_mae': val_mae, 'val_r2': val_metrics['r2']},
                         vocab_sizes, feature_dims, config,
                         local_path=local_best_path,
-                        s3_path=s3_best_model,
-                        is_best=True,
-                        log=log
+                        is_best=True
                     )
                     log.info(f"  ✓ New best model! (MAE: {best_val_mae:.2f}h)")
-                
-                # Periodic checkpoint
-                if config.output.save_checkpoints and epoch % config.training.checkpoint_frequency == 0:
-                    local_ckpt_path = os.path.join(model_dir, f'checkpoint_epoch_{epoch}.pt')
-                    s3_ckpt_path = None if config.output.save_best_only else f"{s3_output_dir}/checkpoint_epoch_{epoch}.pt"
-                    
-                    save_checkpoint(
-                        model, optimizer, scheduler, epoch,
-                        {'val_loss': val_loss, 'val_mae': val_mae},
-                        vocab_sizes, feature_dims, config,
-                        local_path=local_ckpt_path,
-                        s3_path=s3_ckpt_path,
-                        is_best=False,
-                        log=log
-                    )
             
             # Early stopping
             should_stop = torch.tensor([0], device=device)
@@ -742,7 +866,7 @@ def main():
         
         sync_barrier(device)
         
-        # Final test evaluation
+        # Final Test Evaluation
         if rank == 0:
             log.info("=" * 70)
             log.info("FINAL TEST EVALUATION")
@@ -754,7 +878,9 @@ def main():
                 m = model.module if hasattr(model, 'module') else model
                 m.load_state_dict(ckpt['model_state_dict'])
                 
-                test_metrics = validate(model, test_loader, criterion, device, preprocessor, config.training.use_amp)
+                test_metrics = validate(
+                    model, test_loader, criterion, device, preprocessor, config.training.use_amp
+                )
                 
                 log.info(f"Test Results:")
                 log.info(f"  MAE:  {test_metrics['mae']:.2f} hours")
@@ -762,7 +888,6 @@ def main():
                 log.info(f"  MAPE: {test_metrics['mape']:.2f}%")
                 log.info(f"  R²:   {test_metrics['r2']:.4f}")
                 
-                # Save results
                 results = {
                     'experiment_name': config.experiment_name,
                     'best_epoch': best_epoch,
@@ -772,19 +897,14 @@ def main():
                     'config': config.to_dict()
                 }
                 
-                # Save locally
                 local_results_path = os.path.join(model_dir, 'results.json')
                 with open(local_results_path, 'w') as f:
                     json.dump(results, f, indent=2)
-                
-                # Upload to S3
-                upload_dict_to_s3(results, s3_results, log)
             
             log.info("=" * 70)
             log.info(f"TRAINING COMPLETE!")
             log.info(f"  Best epoch: {best_epoch}")
             log.info(f"  Best Val MAE: {best_val_mae:.2f} hours")
-            log.info(f"  S3 Output: {s3_output_dir}")
             log.info("=" * 70)
     
     except Exception as e:
@@ -793,6 +913,12 @@ def main():
         traceback.print_exc()
         raise
     finally:
+        for ds in [train_ds, val_ds, test_ds]:
+            if ds is not None:
+                try:
+                    ds.close()
+                except:
+                    pass
         cleanup_distributed()
 
 

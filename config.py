@@ -4,6 +4,7 @@ from dataclasses import dataclass, field, asdict, fields
 from typing import Dict, Any, Optional, List
 from pathlib import Path
 
+
 def _load_config_json() -> Dict[str, Any]:
     """Load config.json from the same directory as this module."""
     config_path = Path(__file__).parent / "config.json"
@@ -12,20 +13,46 @@ def _load_config_json() -> Dict[str, Any]:
             return json.load(f)
     return {}
 
+
 _CONFIG_JSON = _load_config_json()
 
 
 @dataclass
+class VocabConfig:
+    """Vocabulary lists for categorical features."""
+    event_types: List[str] = field(default_factory=lambda: _CONFIG_JSON.get('vocab', {}).get('event_types', []))
+    problem_types: List[str] = field(default_factory=lambda: _CONFIG_JSON.get('vocab', {}).get('problem_types', []))
+    zip_codes: List[str] = field(default_factory=lambda: _CONFIG_JSON.get('vocab', {}).get('zip_codes', []))
+    locations: List[str] = field(default_factory=lambda: _CONFIG_JSON.get('vocab', {}).get('locations', []))
+    carriers: List[str] = field(default_factory=lambda: _CONFIG_JSON.get('vocab', {}).get('carriers', []))
+    leg_types: List[str] = field(default_factory=lambda: _CONFIG_JSON.get('vocab', {}).get('leg_types', []))
+    ship_methods: List[str] = field(default_factory=lambda: _CONFIG_JSON.get('vocab', {}).get('ship_methods', []))
+    regions: List[str] = field(default_factory=lambda: _CONFIG_JSON.get('vocab', {}).get('regions', []))
+
+
+@dataclass
 class DataConfig:
-    """Data paths."""
+    """Data paths and vocabulary."""
     cache_dir: str = "s3://graph-transformer-exp/cache"
     source_data: str = "s3://graph-transformer-exp/data/test.json"
     distance_file: Optional[str] = None
     num_workers: int = 8
     
-    event_types: List[str] = field(default_factory=lambda: _CONFIG_JSON.get('event_types', []))
-    problem_types: List[str] = field(default_factory=lambda: _CONFIG_JSON.get('problem_types', []))
-    zip_codes: List[str] = field(default_factory=lambda: _CONFIG_JSON.get('zip_codes', []))
+    # Vocabulary configuration
+    vocab: VocabConfig = field(default_factory=VocabConfig)
+    
+    # Backward compatibility properties
+    @property
+    def event_types(self) -> List[str]:
+        return self.vocab.event_types
+    
+    @property
+    def problem_types(self) -> List[str]:
+        return self.vocab.problem_types
+    
+    @property
+    def zip_codes(self) -> List[str]:
+        return self.vocab.zip_codes
     
     @property
     def train_h5(self) -> str:
@@ -92,7 +119,7 @@ class OutputConfig:
     s3_output_dir: str = "s3://graph-transformer-exp/outputs"
     save_checkpoints: bool = True
     save_best_only: bool = False
-    log_every_n_steps: int = 10  # Add this field
+    log_every_n_steps: int = 10
 
 
 @dataclass
@@ -123,9 +150,16 @@ class Config:
                 'source_data': self.data.source_data,
                 'distance_file': self.data.distance_file,
                 'num_workers': self.data.num_workers,
-                'event_types': self.data.event_types,
-                'problem_types': self.data.problem_types,
-                'zip_codes': self.data.zip_codes,
+                'vocab': {
+                    'event_types': self.data.vocab.event_types,
+                    'problem_types': self.data.vocab.problem_types,
+                    'zip_codes': self.data.vocab.zip_codes,
+                    'locations': self.data.vocab.locations,
+                    'carriers': self.data.vocab.carriers,
+                    'leg_types': self.data.vocab.leg_types,
+                    'ship_methods': self.data.vocab.ship_methods,
+                    'regions': self.data.vocab.regions,
+                },
             },
             'model': asdict(self.model),
             'training': asdict(self.training),
@@ -136,6 +170,21 @@ class Config:
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> 'Config':
         data_dict = d.get('data', {})
+        vocab_dict = data_dict.get('vocab', {})
+        
+        # Backward compatibility: check for old flat structure
+        if not vocab_dict and 'event_types' in data_dict:
+            vocab_dict = {
+                'event_types': data_dict.get('event_types', []),
+                'problem_types': data_dict.get('problem_types', []),
+                'zip_codes': data_dict.get('zip_codes', []),
+                'locations': data_dict.get('locations', []),
+                'carriers': data_dict.get('carriers', []),
+                'leg_types': data_dict.get('leg_types', []),
+                'ship_methods': data_dict.get('ship_methods', []),
+                'regions': data_dict.get('regions', []),
+            }
+        
         return cls(
             experiment_name=d.get('experiment_name', 'causal_graph_transformer'),
             data=DataConfig(
@@ -143,9 +192,16 @@ class Config:
                 source_data=data_dict.get('source_data', ''),
                 distance_file=data_dict.get('distance_file'),
                 num_workers=data_dict.get('num_workers', 8),
-                event_types=data_dict.get('event_types', _CONFIG_JSON.get('event_types', [])),
-                problem_types=data_dict.get('problem_types', _CONFIG_JSON.get('problem_types', [])),
-                zip_codes=data_dict.get('zip_codes', _CONFIG_JSON.get('zip_codes', [])),
+                vocab=VocabConfig(
+                    event_types=vocab_dict.get('event_types', _CONFIG_JSON.get('vocab', {}).get('event_types', [])),
+                    problem_types=vocab_dict.get('problem_types', _CONFIG_JSON.get('vocab', {}).get('problem_types', [])),
+                    zip_codes=vocab_dict.get('zip_codes', _CONFIG_JSON.get('vocab', {}).get('zip_codes', [])),
+                    locations=vocab_dict.get('locations', _CONFIG_JSON.get('vocab', {}).get('locations', [])),
+                    carriers=vocab_dict.get('carriers', _CONFIG_JSON.get('vocab', {}).get('carriers', [])),
+                    leg_types=vocab_dict.get('leg_types', _CONFIG_JSON.get('vocab', {}).get('leg_types', [])),
+                    ship_methods=vocab_dict.get('ship_methods', _CONFIG_JSON.get('vocab', {}).get('ship_methods', [])),
+                    regions=vocab_dict.get('regions', _CONFIG_JSON.get('vocab', {}).get('regions', [])),
+                ),
             ),
             model=ModelConfig(**d.get('model', {})),
             training=TrainingConfig(**d.get('training', {})),
@@ -154,6 +210,7 @@ class Config:
         )
     
     def save(self, path: str):
+        """Save config to file (local or S3)."""
         if path.startswith('s3://'):
             import boto3
             path_clean = path.replace('s3://', '')
@@ -161,11 +218,13 @@ class Config:
             json_bytes = json.dumps(self.to_dict(), indent=2).encode('utf-8')
             boto3.client('s3').put_object(Bucket=bucket, Key=key, Body=json_bytes)
         else:
+            os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
             with open(path, 'w') as f:
                 json.dump(self.to_dict(), f, indent=2)
     
     @classmethod
     def load(cls, path: str) -> 'Config':
+        """Load config from file (local or S3)."""
         if path.startswith('s3://'):
             import boto3
             path_parts = path.replace('s3://', '').split('/', 1)
@@ -176,6 +235,21 @@ class Config:
         else:
             with open(path, 'r') as f:
                 return cls.from_dict(json.load(f))
-            
-            
-            
+    
+    def has_vocab(self) -> bool:
+        """Check if vocab is populated."""
+        v = self.data.vocab
+        return bool(v.event_types and v.locations)
+    
+    def get_vocab_sizes(self) -> Dict[str, int]:
+        """Get vocabulary sizes (including PAD and UNKNOWN tokens)."""
+        v = self.data.vocab
+        return {
+            'event_type': len(v.event_types) + 2,  # +2 for PAD, UNKNOWN
+            'location': len(v.locations) + 2,
+            'carrier': len(v.carriers) + 2,
+            'leg_type': len(v.leg_types) + 2,
+            'ship_method': len(v.ship_methods) + 2,
+            'postal': len(v.zip_codes) + 2,
+            'region': len(v.regions) + 2,
+        }
