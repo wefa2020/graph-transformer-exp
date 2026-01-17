@@ -20,6 +20,7 @@ class PackageLifecyclePreprocessor:
     Causal preprocessor for package lifecycle data with Time2Vec support.
     
     All vocabulary comes from config - no data collection during fit.
+    Region lookup (location -> region mapping) comes from distance file.
     """
     
     def __init__(self, config, distance_df: pd.DataFrame = None, distance_file_path: str = None):
@@ -438,7 +439,6 @@ class PackageLifecyclePreprocessor:
             return encoding, 1.0
         
         # Fallback to EXIT problems (old format)
-        # Use _get_location with events and index for proper location resolution
         current_sc = self._get_location(event, events, event_idx)
         if current_sc == 'UNKNOWN':
             return np.zeros(len(self.vocab['problem_types']), dtype=np.float32), 0.0
@@ -446,7 +446,7 @@ class PackageLifecyclePreprocessor:
         for i in range(event_idx + 1, len(events)):
             next_event = events[i]
             next_type = str(next_event.get('event_type', ''))
-            next_sc = self._get_sort_center(next_event)  # Use sort_center directly for EXIT lookup
+            next_sc = self._get_sort_center(next_event)
             
             if next_type == 'EXIT' and next_sc == current_sc:
                 exit_problems = self._parse_problem_field(next_event.get('problem'))
@@ -566,7 +566,7 @@ class PackageLifecyclePreprocessor:
                         label = (next_time - event_time).total_seconds() / 3600
                         label_vals.append([label])
             
-            # Distances - use _get_location with events and indices
+            # Distances
             for i in range(len(events) - 1):
                 from_loc = self._get_location(events[i], events, i)
                 to_loc = self._get_location(events[i + 1], events, i + 1)
@@ -741,7 +741,6 @@ class PackageLifecyclePreprocessor:
         Returns:
             Edge feature array
         """
-        # Get locations using the updated _get_location method
         source_loc = self._get_location(source_event, events, source_idx)
         target_loc = self._get_location(target_event, events, target_idx)
         
@@ -820,7 +819,6 @@ class PackageLifecyclePreprocessor:
             node_realized_time.append(real_time)
             node_realized_other.append(real_other)
             
-            # Get location using updated method with events and index
             location = self._get_location(event, events, i)
             postal = self._get_delivery_postal(event)
             region = self._get_region(location)
@@ -868,7 +866,6 @@ class PackageLifecyclePreprocessor:
         
         for i in range(num_events - 1):
             edge_index.append([i, i + 1])
-            # Pass events and indices for proper location resolution
             edge_feat = self._extract_edge_features(
                 events[i], events[i + 1], event_times[i],
                 events=events, source_idx=i, target_idx=i + 1
@@ -970,6 +967,12 @@ class PackageLifecyclePreprocessor:
         if self.fitted:
             return [c for c in self.postal_encoder.classes_ if c not in ['PAD', 'UNKNOWN']]
         return self.vocab['zip_codes'].copy()
+    
+    def get_regions(self) -> List[str]:
+        """Get the list of regions used."""
+        if self.fitted:
+            return [c for c in self.region_encoder.classes_ if c not in ['PAD', 'UNKNOWN']]
+        return self.vocab['regions'].copy()
     
     # =========================================================================
     # SAVE / LOAD

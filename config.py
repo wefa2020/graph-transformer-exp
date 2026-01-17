@@ -17,17 +17,28 @@ def _load_config_json() -> Dict[str, Any]:
 _CONFIG_JSON = _load_config_json()
 
 
+def _get_vocab_from_json(key: str) -> List[str]:
+    """Get vocab list from config JSON, checking both root and data.vocab locations."""
+    # Check root level first (current config structure)
+    if 'vocab' in _CONFIG_JSON and key in _CONFIG_JSON['vocab']:
+        return _CONFIG_JSON['vocab'][key]
+    # Check under data.vocab (alternative structure)
+    if 'data' in _CONFIG_JSON and 'vocab' in _CONFIG_JSON.get('data', {}):
+        return _CONFIG_JSON['data']['vocab'].get(key, [])
+    return []
+
+
 @dataclass
 class VocabConfig:
     """Vocabulary lists for categorical features."""
-    event_types: List[str] = field(default_factory=lambda: _CONFIG_JSON.get('vocab', {}).get('event_types', []))
-    problem_types: List[str] = field(default_factory=lambda: _CONFIG_JSON.get('vocab', {}).get('problem_types', []))
-    zip_codes: List[str] = field(default_factory=lambda: _CONFIG_JSON.get('vocab', {}).get('zip_codes', []))
-    locations: List[str] = field(default_factory=lambda: _CONFIG_JSON.get('vocab', {}).get('locations', []))
-    carriers: List[str] = field(default_factory=lambda: _CONFIG_JSON.get('vocab', {}).get('carriers', []))
-    leg_types: List[str] = field(default_factory=lambda: _CONFIG_JSON.get('vocab', {}).get('leg_types', []))
-    ship_methods: List[str] = field(default_factory=lambda: _CONFIG_JSON.get('vocab', {}).get('ship_methods', []))
-    regions: List[str] = field(default_factory=lambda: _CONFIG_JSON.get('vocab', {}).get('regions', []))
+    event_types: List[str] = field(default_factory=lambda: _get_vocab_from_json('event_types'))
+    problem_types: List[str] = field(default_factory=lambda: _get_vocab_from_json('problem_types'))
+    zip_codes: List[str] = field(default_factory=lambda: _get_vocab_from_json('zip_codes'))
+    locations: List[str] = field(default_factory=lambda: _get_vocab_from_json('locations'))
+    carriers: List[str] = field(default_factory=lambda: _get_vocab_from_json('carriers'))
+    leg_types: List[str] = field(default_factory=lambda: _get_vocab_from_json('leg_types'))
+    ship_methods: List[str] = field(default_factory=lambda: _get_vocab_from_json('ship_methods'))
+    regions: List[str] = field(default_factory=lambda: _get_vocab_from_json('regions'))
 
 
 @dataclass
@@ -40,19 +51,6 @@ class DataConfig:
     
     # Vocabulary configuration
     vocab: VocabConfig = field(default_factory=VocabConfig)
-    
-    # Backward compatibility properties
-    @property
-    def event_types(self) -> List[str]:
-        return self.vocab.event_types
-    
-    @property
-    def problem_types(self) -> List[str]:
-        return self.vocab.problem_types
-    
-    @property
-    def zip_codes(self) -> List[str]:
-        return self.vocab.zip_codes
     
     @property
     def train_h5(self) -> str:
@@ -81,8 +79,8 @@ class ModelConfig:
     dropout: float = 0.1
     output_dim: int = 1
     use_edge_features: bool = True
-    time2vec_dim:int = 64
-    edge_time2vec_dim:int = 128
+    time2vec_dim: int = 64
+    edge_time2vec_dim: int = 128
     
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> 'ModelConfig':
@@ -94,7 +92,8 @@ class ModelConfig:
         # Filter dictionary to only include valid fields
         filtered = {k: v for k, v in d.items() if k in valid_fields}
         return cls(**filtered)
-    
+
+
 @dataclass
 class TrainingConfig:
     """Training hyperparameters."""
@@ -128,6 +127,24 @@ class DistributedConfig:
     find_unused_parameters: bool = False
 
 
+def _extract_vocab_dict(d: Dict[str, Any]) -> Dict[str, List[str]]:
+    """
+    Extract vocab dictionary from config dict.
+    Checks multiple locations in order of priority:
+    1. Root level 'vocab' key
+    2. Under 'data.vocab'
+    3. Flat structure under 'data' (backward compatibility)
+    4. Falls back to _CONFIG_JSON
+    """
+    vocab_dict = {}
+    
+    # Priority 1: Root level vocab (current config.json structure)
+    if 'vocab' in d and isinstance(d['vocab'], dict):
+        vocab_dict = d['vocab']
+     
+    return vocab_dict
+
+
 @dataclass
 class Config:
     """Main configuration."""
@@ -142,24 +159,30 @@ class Config:
     def s3_experiment_dir(self) -> str:
         return f"{self.output.s3_output_dir.rstrip('/')}/{self.experiment_name}"
     
+    # Direct vocab access for convenience
+    @property
+    def vocab(self) -> VocabConfig:
+        """Direct access to vocab config."""
+        return self.data.vocab
+    
     def to_dict(self) -> Dict[str, Any]:
         return {
             'experiment_name': self.experiment_name,
+            'vocab': {
+                'event_types': self.data.vocab.event_types,
+                'problem_types': self.data.vocab.problem_types,
+                'zip_codes': self.data.vocab.zip_codes,
+                'locations': self.data.vocab.locations,
+                'carriers': self.data.vocab.carriers,
+                'leg_types': self.data.vocab.leg_types,
+                'ship_methods': self.data.vocab.ship_methods,
+                'regions': self.data.vocab.regions,
+            },
             'data': {
                 'cache_dir': self.data.cache_dir,
                 'source_data': self.data.source_data,
                 'distance_file': self.data.distance_file,
                 'num_workers': self.data.num_workers,
-                'vocab': {
-                    'event_types': self.data.vocab.event_types,
-                    'problem_types': self.data.vocab.problem_types,
-                    'zip_codes': self.data.vocab.zip_codes,
-                    'locations': self.data.vocab.locations,
-                    'carriers': self.data.vocab.carriers,
-                    'leg_types': self.data.vocab.leg_types,
-                    'ship_methods': self.data.vocab.ship_methods,
-                    'regions': self.data.vocab.regions,
-                },
             },
             'model': asdict(self.model),
             'training': asdict(self.training),
@@ -169,21 +192,21 @@ class Config:
     
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> 'Config':
+        """Create Config from dictionary, handling multiple vocab locations."""
         data_dict = d.get('data', {})
-        vocab_dict = data_dict.get('vocab', {})
+        vocab_dict = _extract_vocab_dict(d)
         
-        # Backward compatibility: check for old flat structure
-        if not vocab_dict and 'event_types' in data_dict:
-            vocab_dict = {
-                'event_types': data_dict.get('event_types', []),
-                'problem_types': data_dict.get('problem_types', []),
-                'zip_codes': data_dict.get('zip_codes', []),
-                'locations': data_dict.get('locations', []),
-                'carriers': data_dict.get('carriers', []),
-                'leg_types': data_dict.get('leg_types', []),
-                'ship_methods': data_dict.get('ship_methods', []),
-                'regions': data_dict.get('regions', []),
-            }
+        # Build VocabConfig with fallbacks to _CONFIG_JSON
+        vocab_config = VocabConfig(
+            event_types=vocab_dict.get('event_types') or _get_vocab_from_json('event_types'),
+            problem_types=vocab_dict.get('problem_types') or _get_vocab_from_json('problem_types'),
+            zip_codes=vocab_dict.get('zip_codes') or _get_vocab_from_json('zip_codes'),
+            locations=vocab_dict.get('locations') or _get_vocab_from_json('locations'),
+            carriers=vocab_dict.get('carriers') or _get_vocab_from_json('carriers'),
+            leg_types=vocab_dict.get('leg_types') or _get_vocab_from_json('leg_types'),
+            ship_methods=vocab_dict.get('ship_methods') or _get_vocab_from_json('ship_methods'),
+            regions=vocab_dict.get('regions') or _get_vocab_from_json('regions'),
+        )
         
         return cls(
             experiment_name=d.get('experiment_name', 'causal_graph_transformer'),
@@ -192,21 +215,21 @@ class Config:
                 source_data=data_dict.get('source_data', ''),
                 distance_file=data_dict.get('distance_file'),
                 num_workers=data_dict.get('num_workers', 8),
-                vocab=VocabConfig(
-                    event_types=vocab_dict.get('event_types', _CONFIG_JSON.get('vocab', {}).get('event_types', [])),
-                    problem_types=vocab_dict.get('problem_types', _CONFIG_JSON.get('vocab', {}).get('problem_types', [])),
-                    zip_codes=vocab_dict.get('zip_codes', _CONFIG_JSON.get('vocab', {}).get('zip_codes', [])),
-                    locations=vocab_dict.get('locations', _CONFIG_JSON.get('vocab', {}).get('locations', [])),
-                    carriers=vocab_dict.get('carriers', _CONFIG_JSON.get('vocab', {}).get('carriers', [])),
-                    leg_types=vocab_dict.get('leg_types', _CONFIG_JSON.get('vocab', {}).get('leg_types', [])),
-                    ship_methods=vocab_dict.get('ship_methods', _CONFIG_JSON.get('vocab', {}).get('ship_methods', [])),
-                    regions=vocab_dict.get('regions', _CONFIG_JSON.get('vocab', {}).get('regions', [])),
-                ),
+                vocab=vocab_config,
             ),
-            model=ModelConfig(**d.get('model', {})),
-            training=TrainingConfig(**d.get('training', {})),
-            output=OutputConfig(**d.get('output', {})),
-            distributed=DistributedConfig(**d.get('distributed', {})),
+            model=ModelConfig.from_dict(d.get('model', {})),
+            training=TrainingConfig(**{
+                k: v for k, v in d.get('training', {}).items() 
+                if k in {f.name for f in fields(TrainingConfig)}
+            }),
+            output=OutputConfig(**{
+                k: v for k, v in d.get('output', {}).items()
+                if k in {f.name for f in fields(OutputConfig)}
+            }),
+            distributed=DistributedConfig(**{
+                k: v for k, v in d.get('distributed', {}).items()
+                if k in {f.name for f in fields(DistributedConfig)}
+            }),
         )
     
     def save(self, path: str):
@@ -253,3 +276,16 @@ class Config:
             'postal': len(v.zip_codes) + 2,
             'region': len(v.regions) + 2,
         }
+    
+    def print_vocab_summary(self):
+        """Print a summary of loaded vocabulary."""
+        print("=== Vocabulary Summary ===")
+        v = self.data.vocab
+        print(f"  event_types: {len(v.event_types)}")
+        print(f"  problem_types: {len(v.problem_types)}")
+        print(f"  locations: {len(v.locations)}")
+        print(f"  carriers: {len(v.carriers)}")
+        print(f"  leg_types: {len(v.leg_types)}")
+        print(f"  ship_methods: {len(v.ship_methods)}")
+        print(f"  zip_codes: {len(v.zip_codes)}")
+        print(f"  regions: {len(v.regions)}")

@@ -20,6 +20,13 @@
   "AMTRAN_SORTCENTER", "AMTRAN_US_LH_NIT", "AMTRAN_DS_CYCLE1", "USPS_GA_CUBIC", "USPS_ATS_PARCEL", "AMZL_US_PICKUP_AFN", "AMTRAN_DS", "USPS_ATS_BPM", "AMTRAN_US_LH_DAY", "AMZL_US_PICKUP",
   "USPS_3D_SCF_JW_STD", "AMTRAN_DS_LMA", "AMTRAN_CART_DR2", "AMTRAN_SC_CART", "AMTRAN_DS_A", "USPS_FIRST_CLASS_PARCEL", "AMTRAN_DS_XPT", "AMTRAN_DS_CART", "AMTRAN_US_INTERMODAL", "AMTRAN_CART_DR1"
 ],
+    "regions": [
+    "East", "West", "MEU North", "Region-3", "Region-2", "IT North",
+    "Region-1", "ROM - Rest of Mexico", "MEU West/West-South", "North",
+    "FR Sudif", "IT Center-South", "MEU East/East-South", "Metro",
+    "FR North & BE", "MEU AT/South", "Central", "ES Region A", "MENA",
+    "South East", "ES Region B"
+    ],
     "locations" : [
     "ABCD", "ABQ5", "ACES", "ACY5", "ACY8", "ACY9", "AFS1", "AFW5", "AGA2", "AGS5",
     "AIA1", "AIA2", "AID2", "AKS5", "AKT1", "AKY5", "AMH7", "AMO2", "ANC1", "AND8",
