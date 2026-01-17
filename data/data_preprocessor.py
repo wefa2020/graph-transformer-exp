@@ -300,11 +300,34 @@ class PackageLifecyclePreprocessor:
                 return str(postal_id)
         return 'UNKNOWN'
     
-    def _get_location(self, event: Dict) -> str:
-        """Get the primary location for an event."""
+    def _get_location(self, event: Dict, events: List[Dict] = None, event_idx: int = None) -> str:
+        """
+        Get the primary location for an event.
+        
+        For DELIVERY events, the location is the sort_center of the previous event
+        (which is the delivery station - the last facility before delivery).
+        For all other events, the location is the event's own sort_center.
+        
+        Args:
+            event: The current event dictionary
+            events: List of all events in the lifecycle (needed for DELIVERY)
+            event_idx: Index of current event in events list (needed for DELIVERY)
+            
+        Returns:
+            Location string
+        """
         event_type = str(event.get('event_type', ''))
+        
         if event_type == 'DELIVERY':
+            # Delivery station is the location of the previous event (last node before delivery)
+            if events is not None and event_idx is not None and event_idx > 0:
+                prev_event = events[event_idx - 1]
+                prev_location = self._get_sort_center(prev_event)
+                if prev_location != 'UNKNOWN':
+                    return prev_location
+            # Fallback to delivery_station field if available
             return self._get_delivery_station(event)
+        
         return self._get_sort_center(event)
     
     def _parse_datetime(self, time_value) -> Optional[datetime]:
@@ -415,14 +438,15 @@ class PackageLifecyclePreprocessor:
             return encoding, 1.0
         
         # Fallback to EXIT problems (old format)
-        current_sc = self._get_sort_center(event)
+        # Use _get_location with events and index for proper location resolution
+        current_sc = self._get_location(event, events, event_idx)
         if current_sc == 'UNKNOWN':
             return np.zeros(len(self.vocab['problem_types']), dtype=np.float32), 0.0
         
         for i in range(event_idx + 1, len(events)):
             next_event = events[i]
             next_type = str(next_event.get('event_type', ''))
-            next_sc = self._get_sort_center(next_event)
+            next_sc = self._get_sort_center(next_event)  # Use sort_center directly for EXIT lookup
             
             if next_type == 'EXIT' and next_sc == current_sc:
                 exit_problems = self._parse_problem_field(next_event.get('problem'))
@@ -542,10 +566,10 @@ class PackageLifecyclePreprocessor:
                         label = (next_time - event_time).total_seconds() / 3600
                         label_vals.append([label])
             
-            # Distances
+            # Distances - use _get_location with events and indices
             for i in range(len(events) - 1):
-                from_loc = self._get_location(events[i])
-                to_loc = self._get_location(events[i + 1])
+                from_loc = self._get_location(events[i], events, i)
+                to_loc = self._get_location(events[i + 1], events, i + 1)
                 dist, has_dist = self._get_distance(from_loc, to_loc)
                 if has_dist and dist > 0:
                     distance_vals.append([dist])
@@ -591,7 +615,7 @@ class PackageLifecyclePreprocessor:
                 print(f"  {name}: mean={scaler.mean_[0]:.4f}, std={scaler.scale_[0]:.4f}")
     
     # =========================================================================
-    # FEATURE EXTRACTION (unchanged from original)
+    # FEATURE EXTRACTION
     # =========================================================================
     
     def _extract_observable_features(self, event: Dict, prev_event: Dict,
@@ -699,10 +723,27 @@ class PackageLifecyclePreprocessor:
         return time_features, other_features
     
     def _extract_edge_features(self, source_event: Dict, target_event: Dict,
-                                source_time: datetime) -> np.ndarray:
-        """Extract edge features."""
-        source_loc = self._get_location(source_event)
-        target_loc = self._get_location(target_event)
+                                source_time: datetime,
+                                events: List[Dict] = None,
+                                source_idx: int = None,
+                                target_idx: int = None) -> np.ndarray:
+        """
+        Extract edge features between two events.
+        
+        Args:
+            source_event: Source event dictionary
+            target_event: Target event dictionary
+            source_time: Timestamp of source event
+            events: Full list of events (for proper location resolution)
+            source_idx: Index of source event in events list
+            target_idx: Index of target event in events list
+            
+        Returns:
+            Edge feature array
+        """
+        # Get locations using the updated _get_location method
+        source_loc = self._get_location(source_event, events, source_idx)
+        target_loc = self._get_location(target_event, events, target_idx)
         
         distance, has_distance = self._get_distance(source_loc, target_loc)
         distance_scaled = self.edge_distance_scaler.transform([[distance]])[0, 0]
@@ -779,7 +820,8 @@ class PackageLifecyclePreprocessor:
             node_realized_time.append(real_time)
             node_realized_other.append(real_other)
             
-            location = self._get_location(event)
+            # Get location using updated method with events and index
+            location = self._get_location(event, events, i)
             postal = self._get_delivery_postal(event)
             region = self._get_region(location)
             
@@ -826,8 +868,10 @@ class PackageLifecyclePreprocessor:
         
         for i in range(num_events - 1):
             edge_index.append([i, i + 1])
+            # Pass events and indices for proper location resolution
             edge_feat = self._extract_edge_features(
-                events[i], events[i + 1], event_times[i]
+                events[i], events[i + 1], event_times[i],
+                events=events, source_idx=i, target_idx=i + 1
             )
             edge_features.append(edge_feat)
         

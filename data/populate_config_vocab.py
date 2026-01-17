@@ -121,6 +121,7 @@ def update_config_with_vocab(
     Update config file with extracted vocabulary.
     
     Assumes event_types, problem_types, and zip_codes are already in config.
+    Appends new locations to existing locations in config (preserves order).
     
     Args:
         config_path: Path to existing config (local or S3)
@@ -149,8 +150,25 @@ def update_config_with_vocab(
             "These must be configured manually in the config file."
         )
     
-    # Update only the extracted vocabulary
-    config.data.vocab.locations = vocab['locations']
+    # Merge locations: keep existing order, append new locations
+    existing_locations = list(config.data.vocab.locations or [])
+    existing_set = set(existing_locations)
+    extracted_locations = set(vocab['locations'])
+    
+    new_locations = [loc for loc in vocab['locations'] if loc not in existing_set]
+    merged_locations = existing_locations + new_locations
+    
+    if new_locations:
+        print(f"\n=== New Locations Found: {len(new_locations)} ===")
+        for loc in new_locations[:20]:  # Show first 20
+            print(f"  + {loc}")
+        if len(new_locations) > 20:
+            print(f"  ... and {len(new_locations) - 20} more")
+    
+    print(f"\nLocations: {len(existing_locations)} existing + {len(new_locations)} new = {len(merged_locations)} total")
+    
+    # Update vocabulary (append to locations, replace others)
+    config.data.vocab.locations = merged_locations
     config.data.vocab.carriers = vocab['carriers']
     config.data.vocab.leg_types = vocab['leg_types']
     config.data.vocab.ship_methods = vocab['ship_methods']

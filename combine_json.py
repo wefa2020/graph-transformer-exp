@@ -4,7 +4,7 @@ import os
 from pathlib import Path
 from tqdm import tqdm
 
-def combine_json_files(input_dir='/home/ubuntu/graph-transformer-exp/data/graph-data/12100106/', output_file='all.json'):
+def combine_json_files(input_dir='/home/ubuntu/graph-transformer-exp/data/graph-data/', output_file='all.json'):
     """
     Combine all JSON files in a directory into one all.json file
     
