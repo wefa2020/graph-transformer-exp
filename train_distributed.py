@@ -200,6 +200,166 @@ def get_optimal_num_workers(world_size: int, local_rank: int) -> int:
 
 
 # =============================================================================
+# S3 UPLOAD UTILITIES
+# =============================================================================
+
+class S3ModelUploader:
+    """Handle uploading models to S3."""
+    
+    def __init__(
+        self, 
+        bucket: str, 
+        job_name: str, 
+        log: RankLogger,
+        prefix: str = "output"
+    ):
+        self.bucket = bucket
+        self.job_name = job_name
+        self.prefix = prefix
+        self.log = log
+        self._s3_client = None
+    
+    @property
+    def s3_client(self):
+        """Lazy initialization of S3 client."""
+        if self._s3_client is None:
+            import boto3
+            self._s3_client = boto3.client('s3')
+        return self._s3_client
+    
+    @property
+    def best_model_s3_path(self) -> str:
+        """Get the S3 path for best model."""
+        return f"s3://{self.bucket}/{self.prefix}/{self.job_name}/best_model/"
+    
+    def upload_file(self, local_path: str, s3_key: str) -> bool:
+        """
+        Upload a single file to S3.
+        
+        Args:
+            local_path: Local file path
+            s3_key: S3 key (path within bucket)
+            
+        Returns:
+            True if successful, False otherwise
+        """
+        try:
+            self.s3_client.upload_file(local_path, self.bucket, s3_key)
+            return True
+        except Exception as e:
+            self.log.error(f"Failed to upload {local_path} to s3://{self.bucket}/{s3_key}: {e}")
+            return False
+    
+    def upload_best_model(self, local_model_path: str, additional_files: Optional[Dict[str, str]] = None) -> bool:
+        """
+        Upload best model and optional additional files to S3.
+        
+        Args:
+            local_model_path: Path to the local model checkpoint file
+            additional_files: Dict of {local_path: s3_filename} for additional files
+            
+        Returns:
+            True if all uploads successful, False otherwise
+        """
+        if not os.path.exists(local_model_path):
+            self.log.error(f"Model file not found: {local_model_path}")
+            return False
+        
+        # Upload main model file
+        model_filename = os.path.basename(local_model_path)
+        s3_key = f"{self.prefix}/{self.job_name}/best_model/{model_filename}"
+        
+        self.log.info(f"  Uploading best model to {self.best_model_s3_path}")
+        
+        success = self.upload_file(local_model_path, s3_key)
+        
+        if success:
+            self.log.info(f"  ✓ Model uploaded to s3://{self.bucket}/{s3_key}")
+        
+        # Upload additional files if provided
+        if additional_files and success:
+            for local_path, s3_filename in additional_files.items():
+                if os.path.exists(local_path):
+                    add_s3_key = f"{self.prefix}/{self.job_name}/best_model/{s3_filename}"
+                    if self.upload_file(local_path, add_s3_key):
+                        self.log.info(f"  ✓ Uploaded {s3_filename}")
+                    else:
+                        success = False
+        
+        return success
+    
+    def upload_directory(self, local_dir: str, s3_subpath: str = "best_model") -> bool:
+        """
+        Upload all files in a directory to S3.
+        
+        Args:
+            local_dir: Local directory path
+            s3_subpath: Subpath within the job output folder
+            
+        Returns:
+            True if all uploads successful, False otherwise
+        """
+        if not os.path.isdir(local_dir):
+            self.log.error(f"Directory not found: {local_dir}")
+            return False
+        
+        success = True
+        for filename in os.listdir(local_dir):
+            local_path = os.path.join(local_dir, filename)
+            if os.path.isfile(local_path):
+                s3_key = f"{self.prefix}/{self.job_name}/{s3_subpath}/{filename}"
+                if not self.upload_file(local_path, s3_key):
+                    success = False
+        
+        return success
+
+
+def get_s3_uploader(config: Config, log: RankLogger) -> Optional[S3ModelUploader]:
+    """
+    Create S3 uploader from config and environment variables.
+    
+    Args:
+        config: Configuration object
+        log: Logger instance
+        
+    Returns:
+        S3ModelUploader instance or None if configuration is incomplete
+    """
+    # Get bucket from config or environment
+    bucket = getattr(config.data, 's3_output_bucket', None)
+    if bucket is None:
+        bucket = os.environ.get('SM_HP_S3_OUTPUT_BUCKET', None)
+    if bucket is None:
+        # Try to extract from output path if available
+        output_path = os.environ.get('SM_OUTPUT_DATA_DIR', '')
+        if output_path.startswith('s3://'):
+            bucket = output_path.replace('s3://', '').split('/')[0]
+    
+    # Get job name from environment
+    job_name = os.environ.get('SM_TRAINING_JOB_NAME', None)
+    if job_name is None:
+        job_name = os.environ.get('TRAINING_JOB_NAME', None)
+    if job_name is None:
+        # Fallback to experiment name with timestamp
+        job_name = f"{config.experiment_name}_{int(time.time())}"
+    
+    # Get prefix from config or use default
+    prefix = getattr(config.data, 's3_output_prefix', 'output')
+    
+    if bucket is None:
+        log.warning("S3 bucket not configured. Best model will only be saved locally.")
+        log.warning("Set SM_HP_S3_OUTPUT_BUCKET or config.data.s3_output_bucket to enable S3 upload.")
+        return None
+    
+    log.info(f"S3 Upload configured:")
+    log.info(f"  Bucket: {bucket}")
+    log.info(f"  Job Name: {job_name}")
+    log.info(f"  Output Path: s3://{bucket}/{prefix}/{job_name}/best_model/")
+    
+    return S3ModelUploader(bucket=bucket, job_name=job_name, log=log, prefix=prefix)
+
+
+# =============================================================================
 # DATA LOADING WITH SHARED MEMORY
 # =============================================================================
 
@@ -482,6 +642,86 @@ def save_checkpoint(
     os.replace(temp_path, local_path)
 
 
+def save_and_upload_best_model(
+    model, optimizer, scheduler, epoch: int, metrics: Dict,
+    vocab_sizes: Dict, feature_dims: Dict, config: Config,
+    local_path: str, s3_uploader: Optional[S3ModelUploader],
+    preprocessor_path: Optional[str] = None,
+    log: Optional[RankLogger] = None
+) -> bool:
+    """
+    Save checkpoint locally and upload to S3.
+    
+    Args:
+        model: The model to save
+        optimizer: Optimizer state
+        scheduler: Scheduler state
+        epoch: Current epoch
+        metrics: Training metrics
+        vocab_sizes: Vocabulary sizes dict
+        feature_dims: Feature dimensions dict
+        config: Config object
+        local_path: Local path to save the model
+        s3_uploader: S3ModelUploader instance (optional)
+        preprocessor_path: Path to preprocessor file to upload alongside model (optional)
+        log: Logger instance (optional)
+        
+    Returns:
+        True if save (and upload if configured) was successful
+    """
+    # Save locally first
+    save_checkpoint(
+        model, optimizer, scheduler, epoch, metrics,
+        vocab_sizes, feature_dims, config, local_path, is_best=True
+    )
+    
+    # Upload to S3 if uploader is configured
+    if s3_uploader is not None:
+        additional_files = {}
+        
+        # Include preprocessor if available
+        if preprocessor_path and os.path.exists(preprocessor_path):
+            additional_files[preprocessor_path] = 'preprocessor.pkl'
+        
+        # Include config
+        config_path = local_path.replace('.pt', '_config.json')
+        try:
+            with open(config_path, 'w') as f:
+                json.dump(config.to_dict(), f, indent=2)
+            additional_files[config_path] = 'config.json'
+        except Exception as e:
+            if log:
+                log.warning(f"Failed to save config: {e}")
+        
+        # Include metrics
+        metrics_path = local_path.replace('.pt', '_metrics.json')
+        try:
+            with open(metrics_path, 'w') as f:
+                json.dump({
+                    'epoch': epoch,
+                    'metrics': {k: float(v) if isinstance(v, (int, float)) else v for k, v in metrics.items()}
+                }, f, indent=2)
+            additional_files[metrics_path] = 'metrics.json'
+        except Exception as e:
+            if log:
+                log.warning(f"Failed to save metrics: {e}")
+        
+        # Upload to S3
+        success = s3_uploader.upload_best_model(local_path, additional_files)
+        
+        # Cleanup temporary files
+        for temp_file in [config_path, metrics_path]:
+            if os.path.exists(temp_file):
+                try:
+                    os.remove(temp_file)
+                except:
+                    pass
+        
+        return success
+    
+    return True
+
+
 # =============================================================================
 # TRAINING LOOP
 # =============================================================================
@@ -718,13 +958,22 @@ def main():
     log.info(f"  Shared Memory: ENABLED")
     log.info("=" * 70)
     
+    # Initialize S3 uploader (rank 0 only)
+    s3_uploader = None
+    if rank == 0:
+        s3_uploader = get_s3_uploader(config, log)
+    
     train_ds, val_ds, test_ds = None, None, None
+    preprocessor_local_path = None
     
     try:
         # Load data into shared memory
         train_ds, val_ds, test_ds, preprocessor = load_data_shared_memory(
             config, rank, local_rank, world_size, log
         )
+        
+        # Store preprocessor path for S3 upload
+        preprocessor_local_path = os.path.join(model_dir, 'preprocessor.pkl')
         
         gc.collect()
         torch.cuda.empty_cache()
@@ -844,14 +1093,26 @@ def main():
                     best_epoch = epoch
                     
                     local_best_path = os.path.join(model_dir, 'best_model.pt')
-                    save_checkpoint(
-                        model, optimizer, scheduler, epoch,
-                        {'val_loss': val_loss, 'val_mae': val_mae, 'val_r2': val_metrics['r2']},
-                        vocab_sizes, feature_dims, config,
+                    
+                    # Save locally and upload to S3
+                    save_and_upload_best_model(
+                        model=model,
+                        optimizer=optimizer,
+                        scheduler=scheduler,
+                        epoch=epoch,
+                        metrics={'val_loss': val_loss, 'val_mae': val_mae, 'val_r2': val_metrics['r2']},
+                        vocab_sizes=vocab_sizes,
+                        feature_dims=feature_dims,
+                        config=config,
                         local_path=local_best_path,
-                        is_best=True
+                        s3_uploader=s3_uploader,
+                        preprocessor_path=preprocessor_local_path,
+                        log=log
                     )
+                    
                     log.info(f"  ✓ New best model! (MAE: {best_val_mae:.2f}h)")
+                    if s3_uploader:
+                        log.info(f"  ✓ Uploaded to {s3_uploader.best_model_s3_path}")
             
             # Early stopping
             should_stop = torch.tensor([0], device=device)
@@ -900,11 +1161,19 @@ def main():
                 local_results_path = os.path.join(model_dir, 'results.json')
                 with open(local_results_path, 'w') as f:
                     json.dump(results, f, indent=2)
+                
+                # Upload final results to S3
+                if s3_uploader:
+                    s3_key = f"{s3_uploader.prefix}/{s3_uploader.job_name}/best_model/results.json"
+                    if s3_uploader.upload_file(local_results_path, s3_key):
+                        log.info(f"  ✓ Results uploaded to S3")
             
             log.info("=" * 70)
             log.info(f"TRAINING COMPLETE!")
             log.info(f"  Best epoch: {best_epoch}")
             log.info(f"  Best Val MAE: {best_val_mae:.2f} hours")
+            if s3_uploader:
+                log.info(f"  Model saved to: {s3_uploader.best_model_s3_path}")
             log.info("=" * 70)
     
     except Exception as e:

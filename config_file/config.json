@@ -2279,8 +2279,8 @@
   },
   
   "training": {
-    "epochs": 100,
-    "batch_size": 64,
+    "epochs": 200,
+    "batch_size": 192,
     "learning_rate": 0.0001,
     "weight_decay": 0.01,
     "warmup_epochs": 5,

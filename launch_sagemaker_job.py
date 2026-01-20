@@ -154,7 +154,7 @@ if __name__ == '__main__':
     parser.add_argument('--epochs', type=int, default=100)
     parser.add_argument('--batch-size', type=int, default=64)
     parser.add_argument('--learning-rate', type=float, default=1e-4)
-    parser.add_argument('--hidden-dim', type=int, default=256)
+    parser.add_argument('--hidden-dim', type=int, default=512)
     parser.add_argument('--num-layers', type=int, default=40)
     parser.add_argument('--num-heads', type=int, default=8)
     parser.add_argument('--dropout', type=float, default=0.1)
@@ -167,8 +167,8 @@ if __name__ == '__main__':
     # Optional
     parser.add_argument('--role', type=str, default=None)
     parser.add_argument('--use-spot', action='store_true')
-    parser.add_argument('--max-run-hours', type=int, default=240)
-    parser.add_argument('--max-wait-hours', type=int, default=480)
+    parser.add_argument('--max-run-hours', type=int, default=480)
+    parser.add_argument('--max-wait-hours', type=int, default=500)
     
     args = parser.parse_args()
     
