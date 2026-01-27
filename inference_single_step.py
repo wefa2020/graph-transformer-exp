@@ -1,12 +1,4 @@
 #!/usr/bin/env python3
-"""
-inference.py - Neptune-based inference with leg_plan skeleton and iterative rolling predictions
-Uses predicted times (not plan times) to continue the prediction chain
-Includes plan_time for each event
-
-Updated for Time2Vec preprocessor format with separate time/other features.
-Aligned with CausalH5BatchCollator output format.
-"""
 
 import torch
 import numpy as np
@@ -32,12 +24,10 @@ from data.neptune_extractor import (
 )
 
 
-# ============================================================================
-# CONFIGURATION
-# ============================================================================
-
 PACKAGE_IDS = [
-    "ç",
+    "TBA328104955122",
+    "TBA327930638904",
+    "TBA328017923727",
     "TBA327930638904",
     "TBA327907450335",
     "TBA328017923366",
@@ -67,12 +57,7 @@ STRICT_LEG_PLAN_VALIDATION = False
 ALLOW_UNDELIVERED = True
 
 
-# ============================================================================
-# TENSOR UTILITIES
-# ============================================================================
-
 def to_tensor(arr: np.ndarray, dtype: torch.dtype) -> torch.Tensor:
-    """Convert numpy array to tensor with proper dtype."""
     if dtype == torch.long:
         return torch.from_numpy(np.ascontiguousarray(arr, dtype=np.int64))
     elif dtype == torch.float32:
@@ -82,14 +67,8 @@ def to_tensor(arr: np.ndarray, dtype: torch.dtype) -> torch.Tensor:
     return torch.from_numpy(arr)
 
 
-# ============================================================================
-# INFERENCE CLASS
-# ============================================================================
-
 class EventTimeInference:
-    """Inference class with iterative rolling predictions."""
     
-    # Node categorical fields (matches CausalH5BatchCollator)
     _NODE_CAT_FIELDS = [
         'event_type', 'location', 'postal', 'region',
         'carrier', 'leg_type', 'ship_method'
@@ -108,32 +87,28 @@ class EventTimeInference:
         self.strict_validation = strict_validation
         self.allow_undelivered = allow_undelivered
         
-        print(f"Using device: {self.device}")
+        print(f"Using device: {self.device}", flush=True)
         
         if self.device.type == 'cuda':
-            print(f"GPU: {torch.cuda.get_device_name(0)}")
+            print(f"GPU: {torch.cuda.get_device_name(0)}", flush=True)
         
-        # Load preprocessor
-        print(f"Loading preprocessor from {preprocessor_path}")
+        print(f"Loading preprocessor from {preprocessor_path}", flush=True)
         if not os.path.exists(preprocessor_path):
             raise FileNotFoundError(f"Preprocessor not found: {preprocessor_path}")
         self.preprocessor = PackageLifecyclePreprocessor.load(preprocessor_path)
         
-        # Load checkpoint
-        print(f"Loading checkpoint from {checkpoint_path}")
+        print(f"Loading checkpoint from {checkpoint_path}", flush=True)
         if not os.path.exists(checkpoint_path):
             raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
         self.checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
         
-        # Extract vocab_sizes and feature_dims from checkpoint
         self.vocab_sizes = self.checkpoint['vocab_sizes']
         self.feature_dims = self.checkpoint['feature_dims']
         
-        # Load full config from checkpoint
         full_config = Config.from_dict(self.checkpoint['config'])
-        self.model_config = full_config.model  # Store for reference
+        self.model_config = full_config.model
         
-        print("Initializing model...")
+        print("Initializing model...", flush=True)
         self.model = EventTimePredictor.from_config(
             config=full_config,
             vocab_sizes=self.vocab_sizes,
@@ -143,29 +118,27 @@ class EventTimeInference:
         self.model.load_state_dict(self.checkpoint['model_state_dict'])
         self.model.eval()
         
-        print(f"Model loaded from epoch {self.checkpoint.get('epoch', 'unknown') + 1}")
+        print(f"Model loaded from epoch {self.checkpoint.get('epoch', 'unknown') + 1}", flush=True)
         metrics = self.checkpoint.get('metrics', {})
         if metrics:
-            print(f"Checkpoint metrics:")
+            print(f"Checkpoint metrics:", flush=True)
             for k, v in metrics.items():
                 if isinstance(v, float):
-                    print(f"  {k}: {v:.4f}")
+                    print(f"  {k}: {v:.4f}", flush=True)
                 else:
-                    print(f"  {k}: {v}")
+                    print(f"  {k}: {v}", flush=True)
         
-        # Connect to Neptune
-        print(f"Connecting to Neptune at {neptune_endpoint}")
+        print(f"Connecting to Neptune at {neptune_endpoint}", flush=True)
         self.neptune_endpoint = neptune_endpoint
         self.extractor = NeptuneDataExtractor(
             endpoint=neptune_endpoint,
             max_workers=1
         )
-        print("Neptune connection established")
-        print(f"Strict leg_plan validation: {self.strict_validation}")
-        print(f"Allow undelivered packages: {self.allow_undelivered}")
+        print("Neptune connection established", flush=True)
+        print(f"Strict leg_plan validation: {self.strict_validation}", flush=True)
+        print(f"Allow undelivered packages: {self.allow_undelivered}", flush=True)
     
     def fetch_package(self, package_id: str) -> Optional[Dict]:
-        """Fetch package from Neptune."""
         try:
             package_data = _extract_package_edges_optimized(self.extractor.main_client, package_id)
             
@@ -175,14 +148,14 @@ class EventTimeInference:
             if not self.allow_undelivered:
                 is_valid, invalid_reason = _validate_package_sequence(package_data)
                 if not is_valid:
-                    print(f"  Package {package_id} invalid: {invalid_reason}")
+                    print(f"  Package {package_id} invalid: {invalid_reason}", flush=True)
                     return None
             
             package_data = _deduplicate_events(package_data)
             return package_data
             
         except Exception as e:
-            print(f"  Error fetching package {package_id}: {e}")
+            print(f"  Error fetching package {package_id}: {e}", flush=True)
             return None
     
     def _is_origin_id(self, location_id: str) -> bool:
@@ -203,11 +176,10 @@ class EventTimeInference:
                 return None
             return leg_plan
         except (json.JSONDecodeError, TypeError, AttributeError) as e:
-            print(f"    Warning: Failed to parse leg_plan: {e}")
+            print(f"    Warning: Failed to parse leg_plan: {e}", flush=True)
             return None
     
     def _create_skeleton_from_leg_plan(self, leg_plan: Dict, dest_postal: str) -> List[Dict]:
-        """Create event skeleton from leg_plan."""
         skeleton = []
         location_ids = list(leg_plan.keys())
         
@@ -232,7 +204,6 @@ class EventTimeInference:
             is_first_sc = (i == 0)
             
             if is_first_sc:
-                # INDUCT - use plan_time and cpt from leg_plan
                 skeleton.append({
                     'event_idx': event_idx,
                     'event_type': 'INDUCT',
@@ -244,19 +215,17 @@ class EventTimeInference:
                 })
                 event_idx += 1
                 
-                # EXIT - plan_time is previous event's CPT
                 skeleton.append({
                     'event_idx': event_idx,
                     'event_type': 'EXIT',
                     'location': sc_id,
-                    'plan_time': sc_data.get('cpt'),  # EXIT plan_time = previous CPT
+                    'plan_time': sc_data.get('cpt'),
                     'cpt': None,
                     'ship_method': None,
                     'is_first_event': False,
                 })
                 event_idx += 1
             else:
-                # LINEHAUL - use plan_time and cpt from leg_plan
                 skeleton.append({
                     'event_idx': event_idx,
                     'event_type': 'LINEHAUL',
@@ -268,19 +237,17 @@ class EventTimeInference:
                 })
                 event_idx += 1
                 
-                # EXIT - plan_time is previous event's CPT
                 skeleton.append({
                     'event_idx': event_idx,
                     'event_type': 'EXIT',
                     'location': sc_id,
-                    'plan_time': sc_data.get('cpt'),  # EXIT plan_time = previous CPT
+                    'plan_time': sc_data.get('cpt'),
                     'cpt': None,
                     'ship_method': None,
                     'is_first_event': False,
                 })
                 event_idx += 1
         
-        # DELIVERY event
         if sort_centers:
             last_sc_id = sort_centers[-1][0]
             delivery_plan_time = None
@@ -355,30 +322,20 @@ class EventTimeInference:
         skeleton: List[Dict],
         neptune_event: Optional[Dict]
     ) -> Optional[str]:
-        """
-        Get plan_time for an event:
-        - For actual events: use Neptune event's plan_time if available
-        - For EXIT events: use previous event's CPT
-        - Otherwise: use skeleton's plan_time
-        """
-        # For actual events, try Neptune's plan_time first
         if neptune_event:
             neptune_plan_time = neptune_event.get('plan_time')
             if neptune_plan_time:
                 return neptune_plan_time
         
-        # For EXIT events, use previous event's CPT
         if event_type == 'EXIT' and event_idx > 0:
             prev_skel = skeleton[event_idx - 1]
             prev_cpt = prev_skel.get('cpt')
             if prev_cpt:
                 return prev_cpt
-            # Also check context for CPT
             prev_context = prev_skel.get('context', {})
             if prev_context.get('cpt'):
                 return prev_context.get('cpt')
         
-        # Fall back to skeleton's plan_time
         skel = skeleton[event_idx]
         return skel.get('plan_time')
     
@@ -387,10 +344,6 @@ class EventTimeInference:
         skeleton: List[Dict], 
         neptune_events: List[Dict]
     ) -> Tuple[List[Dict], List[str], Dict[int, Dict]]:
-        """
-        Match Neptune events to skeleton.
-        Returns: (filled_skeleton, errors, matched_neptune_events_by_idx)
-        """
         errors = []
         
         filled_skeleton = []
@@ -407,7 +360,7 @@ class EventTimeInference:
             neptune_index[key].append((i, event))
         
         matched_neptune_indices = set()
-        matched_neptune_events_by_skel_idx = {}  # skeleton_idx -> neptune_event
+        matched_neptune_events_by_skel_idx = {}
         
         for skel_idx, skel in enumerate(filled_skeleton):
             skel_loc = skel['location']
@@ -429,14 +382,12 @@ class EventTimeInference:
                 skel['neptune_matched'] = True
                 skel['is_predicted'] = False
                 
-                # Get plan_time for this event
                 plan_time = self._get_plan_time_for_event(
                     skel_idx, skel_type, filled_skeleton, matched_event
                 )
                 
                 context = {'has_problem': False}
                 
-                # Problem handling - works with both old (EXIT) and new (INDUCT/LINEHAUL) formats
                 problem = matched_event.get('problem')
                 if problem:
                     context['problem'] = problem
@@ -471,13 +422,11 @@ class EventTimeInference:
                 if delivery_station:
                     context['delivery_station'] = delivery_station
                 
-                # Add CPT from Neptune event or skeleton
                 cpt = matched_event.get('cpt') or skel.get('cpt')
                 if cpt:
                     context['cpt'] = cpt
-                    skel['cpt'] = cpt  # Store for EXIT event reference
+                    skel['cpt'] = cpt
                 
-                # Store plan_time
                 skel['plan_time'] = plan_time
                 
                 skel['context'] = context
@@ -486,7 +435,6 @@ class EventTimeInference:
                 skel['neptune_matched'] = False
                 skel['is_predicted'] = True
                 
-                # Get plan_time for predicted event
                 plan_time = self._get_plan_time_for_event(
                     skel_idx, skel_type, filled_skeleton, None
                 )
@@ -516,7 +464,6 @@ class EventTimeInference:
         package_data: Dict, 
         events_with_times: List[Dict]
     ) -> Dict:
-        """Build a synthetic package for inference."""
         synthetic = {
             'package_id': package_data.get('package_id'),
             'tracking_id': package_data.get('package_id'),
@@ -555,27 +502,19 @@ class EventTimeInference:
         return synthetic
     
     def _features_to_pyg_data(self, features: Dict) -> Data:
-        """
-        Convert preprocessor features dict to PyG Data object.
-        
-        Aligned with CausalH5BatchCollator output format for consistency.
-        """
         node_cat = features['node_categorical_indices']
         pkg_cat = features['package_categorical']
         
-        # Handle package_features shape - collator outputs [1, package_dim]
         pkg_feat = features['package_features']
         if pkg_feat.ndim == 1:
             pkg_feat = pkg_feat.reshape(1, -1)
         
         data = Data(
-            # Time features (for Time2Vec)
             node_observable_time=to_tensor(features['node_observable_time'], torch.float32),
             node_observable_other=to_tensor(features['node_observable_other'], torch.float32),
             node_realized_time=to_tensor(features['node_realized_time'], torch.float32),
             node_realized_other=to_tensor(features['node_realized_other'], torch.float32),
             
-            # Categorical indices
             event_type_idx=to_tensor(node_cat['event_type'], torch.long),
             location_idx=to_tensor(node_cat['location'], torch.long),
             postal_idx=to_tensor(node_cat['postal'], torch.long),
@@ -584,11 +523,9 @@ class EventTimeInference:
             leg_type_idx=to_tensor(node_cat['leg_type'], torch.long),
             ship_method_idx=to_tensor(node_cat['ship_method'], torch.long),
             
-            # Edge features
             edge_index=to_tensor(features['edge_index'], torch.long),
             edge_features=to_tensor(features['edge_features'], torch.float32),
             
-            # Package features
             package_features=to_tensor(pkg_feat, torch.float32),
             source_postal_idx=torch.tensor([pkg_cat['source_postal']], dtype=torch.long),
             dest_postal_idx=torch.tensor([pkg_cat['dest_postal']], dtype=torch.long),
@@ -596,7 +533,6 @@ class EventTimeInference:
             num_nodes=features['num_nodes'],
         )
         
-        # Add labels if present - use edge_labels to match collator
         if 'labels' in features:
             labels = features['labels']
             if labels.ndim > 1:
@@ -661,22 +597,27 @@ class EventTimeInference:
         predicted_dt = prev_dt + timedelta(hours=predicted_hours)
         return predicted_dt.isoformat()
     
+    def _check_if_delivered(self, package_data: Dict) -> bool:
+        """Check if package is delivered based on Neptune events."""
+        neptune_events = package_data.get('events', [])
+        for event in neptune_events:
+            if event.get('event_type') == 'DELIVERY':
+                return True
+        return False
+    
     @torch.no_grad()
     def _run_single_inference(self, synthetic_package: Dict) -> Optional[np.ndarray]:
-        """Run model inference on a synthetic package."""
         try:
             features = self.preprocessor.process_lifecycle(synthetic_package, return_labels=True)
             if features is None:
                 return None
             
-            # Check minimum events
             if features['num_nodes'] < 2:
                 return None
             
             graph_data = self._features_to_pyg_data(features)
             graph_data = graph_data.to(self.device)
             
-            # Create batch - matches CausalH5BatchCollator output
             batch = Batch.from_data_list([graph_data])
             batch.node_counts = torch.tensor([graph_data.num_nodes], dtype=torch.long, device=self.device)
             batch.edge_counts = torch.tensor([graph_data.edge_index.shape[1]], dtype=torch.long, device=self.device)
@@ -684,186 +625,34 @@ class EventTimeInference:
             with torch.amp.autocast('cuda', enabled=self.device.type == 'cuda'):
                 predictions = self.model(batch)
             
-            # Get all predictions (one per edge)
             preds = predictions.squeeze(-1) if predictions.dim() > 1 else predictions
             preds_scaled = preds.float().cpu().numpy()
             preds_hours = self.preprocessor.inverse_transform_time(preds_scaled).flatten()
             
             return preds_hours
         except Exception as e:
-            print(f"    Inference error: {e}")
+            print(f"    Inference error: {e}", flush=True)
             import traceback
             traceback.print_exc()
             return None
     
     @torch.no_grad()
-    def _run_iterative_predictions(
-        self, 
-        package_data: Dict, 
-        filled_skeleton: List[Dict]
-    ) -> Tuple[List[Dict], Dict[int, float]]:
-        """
-        Run predictions iteratively, handling interspersed actual/predicted events.
-        """
-        working_skeleton = [dict(s) for s in filled_skeleton]
-        predictions_by_edge = {}
-        
-        if len(working_skeleton) < 2:
-            return working_skeleton, predictions_by_edge
-        
-        # Check first event has actual time
-        if not working_skeleton[0].get('neptune_matched', False):
-            return working_skeleton, predictions_by_edge
-        
-        # Build events list incrementally, predicting as we go
-        events_for_inference = [dict(working_skeleton[0])]
-        
-        for target_idx in range(1, len(working_skeleton)):
-            target_skel = working_skeleton[target_idx]
-            prev_event = events_for_inference[-1]
-            prev_event_time = prev_event.get('event_time')
-            
-            if not prev_event_time:
-                # Can't continue without a previous time
-                break
-            
-            # Prepare target event for inference (use prev time as placeholder)
-            target_event_for_inference = dict(target_skel)
-            target_event_for_inference['event_time'] = prev_event_time
-            
-            # Run inference with all events so far + target
-            inference_events = events_for_inference + [target_event_for_inference]
-            synthetic = self._build_synthetic_package(package_data, inference_events)
-            
-            preds = self._run_single_inference(synthetic)
-            
-            if preds is not None and len(preds) > 0:
-                # Get prediction for the last edge (to target event)
-                pred_hours = float(preds[-1])
-                edge_idx = target_idx - 1  # Edge index in skeleton
-                predictions_by_edge[edge_idx] = pred_hours
-                
-                # Determine the event time to use going forward
-                if target_skel.get('neptune_matched', False):
-                    # Actual event - use real time
-                    actual_time = target_skel.get('event_time')
-                    working_skeleton[target_idx]['predicted_time'] = self._calculate_predicted_datetime(
-                        prev_event_time, pred_hours
-                    )
-                    
-                    # Add to inference list with actual time
-                    updated_event = dict(target_skel)
-                    updated_event['event_time'] = actual_time
-                    events_for_inference.append(updated_event)
-                else:
-                    # Predicted event - calculate and use predicted time
-                    predicted_dt = self._calculate_predicted_datetime(prev_event_time, pred_hours)
-                    working_skeleton[target_idx]['event_time'] = predicted_dt
-                    working_skeleton[target_idx]['predicted_time'] = predicted_dt
-                    
-                    # Add to inference list with predicted time
-                    updated_event = dict(target_skel)
-                    updated_event['event_time'] = predicted_dt
-                    events_for_inference.append(updated_event)
-            else:
-                # Inference failed - try to continue if we have actual data
-                if target_skel.get('neptune_matched', False):
-                    events_for_inference.append(dict(target_skel))
-                else:
-                    # Can't continue - no prediction and no actual
-                    break
-        
-        return working_skeleton, predictions_by_edge
-    
-    def _build_output_events(
-        self, 
-        working_skeleton: List[Dict], 
-        predictions_by_edge: Dict[int, float],
-        original_skeleton: List[Dict]
-    ) -> List[Dict]:
-        """Build final output events with all predictions, metrics, and plan_time."""
-        output_events = []
-        
-        for i, skel in enumerate(working_skeleton):
-            is_predicted = skel.get('is_predicted', False)
-            original_skel = original_skeleton[i]
-            
-            # Get actual event time (only for Neptune-matched events)
-            actual_event_time = None
-            if original_skel.get('neptune_matched', False):
-                actual_event_time = original_skel.get('event_time')
-            
-            # Get plan_time
-            plan_time = skel.get('plan_time')
-            
-            # Build event output with is_predicted first
-            event_output = {
-                'is_predicted': is_predicted,
-                'event_idx': skel['event_idx'],
-                'event_type': skel['event_type'],
-                'location': skel['location'],
-                'plan_time': self._format_event_time(plan_time),
-                'event_time': self._format_event_time(skel.get('event_time')) if not is_predicted else None,
-                'predicted_time': self._format_event_time(skel.get('predicted_time')) if is_predicted else None,
-                'context': skel.get('context', {}),
-            }
-            
-            # Add prediction info for events after the first
-            if i > 0:
-                edge_idx = i - 1
-                pred_hours = predictions_by_edge.get(edge_idx)
-                
-                if pred_hours is not None:
-                    event_output['predicted_hours'] = pred_hours
-                    
-                    # Calculate predicted_time for actual events too
-                    if not is_predicted:
-                        prev_time = working_skeleton[i-1].get('event_time')
-                        if prev_time:
-                            event_output['predicted_time'] = self._calculate_predicted_datetime(prev_time, pred_hours)
-                    
-                    # Calculate actual_hours and ae for actual events
-                    if not is_predicted and actual_event_time:
-                        prev_original = original_skeleton[i-1]
-                        if prev_original.get('neptune_matched', False):
-                            prev_actual_time = prev_original.get('event_time')
-                            if prev_actual_time:
-                                prev_dt = self._parse_event_time(prev_actual_time)
-                                curr_dt = self._parse_event_time(actual_event_time)
-                                if prev_dt and curr_dt:
-                                    actual_hours = (curr_dt - prev_dt).total_seconds() / 3600.0
-                                    event_output['actual_hours'] = actual_hours
-                                    event_output['ae'] = abs(pred_hours - actual_hours)
-            
-            output_events.append(event_output)
-        
-        return output_events
-    
-    def _calculate_eta(self, output_events: List[Dict]) -> Optional[str]:
-        if not output_events:
-            return None
-        
-        last_event = output_events[-1]
-        if last_event.get('event_type') == 'DELIVERY':
-            # For predicted events, use predicted_time; for actual, use event_time
-            if last_event.get('is_predicted'):
-                return last_event.get('predicted_time')
-            else:
-                return last_event.get('event_time')
-        
-        return None
-    
-    @torch.no_grad()
-    def predict_single(self, package_id: str, package_data: Optional[Dict] = None) -> Dict:
-        """Predict event times with iterative rolling predictions."""
+    def predict_next_event(self, package_id: str, package_data: Optional[Dict] = None) -> Dict:
         if package_data is None:
             package_data = self.fetch_package(package_id)
         
         if package_data is None:
             return {
-                'package_id': package_id,
+                'tracking_id': package_id,
                 'status': 'error',
                 'error': 'Package not found or invalid'
+            }
+        
+        # Check if already delivered - return simple response
+        if self._check_if_delivered(package_data):
+            return {
+                'tracking_id': package_id,
+                'status': 'delivered'
             }
         
         neptune_events = package_data.get('events', [])
@@ -873,7 +662,7 @@ class EventTimeInference:
         
         if not leg_plan:
             return {
-                'package_id': package_id,
+                'tracking_id': package_id,
                 'status': 'error',
                 'error': 'No leg_plan available or failed to parse'
             }
@@ -883,72 +672,148 @@ class EventTimeInference:
         
         if not skeleton:
             return {
-                'package_id': package_id,
+                'tracking_id': package_id,
                 'status': 'error',
                 'error': 'Failed to create skeleton from leg_plan'
             }
         
-        # Match Neptune events to skeleton
         filled_skeleton, match_errors, matched_neptune = self._match_neptune_events_to_skeleton(
             skeleton, neptune_events
         )
         
-        # Keep original for comparison
         original_skeleton = [dict(s) for s in filled_skeleton]
         
-        # Determine delivery status
         delivery_status = self._determine_delivery_status(filled_skeleton)
         
-        # Get last known location
-        last_known_location = None
-        if delivery_status == 'IN_TRANSIT':
-            last_known_location = self._get_last_known_location(filled_skeleton)
+        # Double check - if delivery status is DELIVERED, return simple response
+        if delivery_status == 'DELIVERED':
+            return {
+                'tracking_id': package_id,
+                'status': 'delivered'
+            }
         
-        # Check if first event has actual data
+        last_known_location = self._get_last_known_location(filled_skeleton)
+        
         if filled_skeleton[0].get('is_predicted', True):
             return {
-                'package_id': package_id,
+                'tracking_id': package_id,
                 'status': 'error',
                 'error': 'First event (INDUCT) has no Neptune data - cannot start predictions',
                 'delivery_status': delivery_status,
             }
         
-        # Count events
-        actual_event_count = sum(1 for s in filled_skeleton if s.get('neptune_matched', False))
-        predicted_event_count = sum(1 for s in filled_skeleton if s.get('is_predicted', False))
+        next_event_idx = None
+        for i, skel in enumerate(filled_skeleton):
+            if skel.get('is_predicted', False):
+                next_event_idx = i
+                break
         
-        # In strict mode, reject delivered packages with missing events
-        if self.strict_validation and delivery_status == 'DELIVERED' and predicted_event_count > 0:
+        if next_event_idx is None:
             return {
-                'package_id': package_id,
+                'tracking_id': package_id,
                 'status': 'error',
-                'error': f'Delivered package has missing events: {predicted_event_count} events not found',
+                'error': 'All events matched but delivery status is not DELIVERED',
                 'delivery_status': delivery_status,
-                'match_errors': match_errors,
             }
         
+        if next_event_idx == 0:
+            return {
+                'tracking_id': package_id,
+                'status': 'error',
+                'error': 'Cannot predict - no actual events before the next event',
+                'delivery_status': delivery_status,
+            }
+        
+        actual_event_count = sum(1 for s in filled_skeleton if s.get('neptune_matched', False))
+        
         try:
-            # Run iterative predictions
-            working_skeleton, predictions_by_edge = self._run_iterative_predictions(
-                package_data, filled_skeleton
-            )
+            events_for_inference = []
+            for i in range(next_event_idx):
+                if filled_skeleton[i].get('neptune_matched', False):
+                    events_for_inference.append(dict(filled_skeleton[i]))
             
-            # Build output events
-            output_events = self._build_output_events(
-                working_skeleton, predictions_by_edge, original_skeleton
-            )
+            if not events_for_inference:
+                return {
+                    'tracking_id': package_id,
+                    'status': 'error',
+                    'error': 'No actual events available for inference',
+                    'delivery_status': delivery_status,
+                }
             
-            # Calculate ETA
-            eta = self._calculate_eta(output_events)
+            prev_event = events_for_inference[-1]
+            prev_event_time = prev_event.get('event_time')
             
-            # Calculate metrics
-            all_ae = [e['ae'] for e in output_events if e.get('ae') is not None]
-            valid_preds = [e['predicted_hours'] for e in output_events 
-                          if e.get('predicted_hours') is not None]
-            valid_actuals = [e['actual_hours'] for e in output_events 
-                           if e.get('actual_hours') is not None]
+            if not prev_event_time:
+                return {
+                    'tracking_id': package_id,
+                    'status': 'error',
+                    'error': 'Previous event has no timestamp',
+                    'delivery_status': delivery_status,
+                }
             
-            # Check for problems
+            target_skel = filled_skeleton[next_event_idx]
+            target_event_for_inference = dict(target_skel)
+            target_event_for_inference['event_time'] = prev_event_time
+            
+            inference_events = events_for_inference + [target_event_for_inference]
+            synthetic = self._build_synthetic_package(package_data, inference_events)
+            
+            preds = self._run_single_inference(synthetic)
+            
+            if preds is None or len(preds) == 0:
+                return {
+                    'tracking_id': package_id,
+                    'status': 'error',
+                    'error': 'Model inference failed',
+                    'delivery_status': delivery_status,
+                }
+            
+            pred_hours = float(preds[-1])
+            predicted_dt = self._calculate_predicted_datetime(prev_event_time, pred_hours)
+            
+            output_events = []
+            
+            for i in range(next_event_idx):
+                skel = filled_skeleton[i]
+                
+                event_output = {
+                    'is_predicted': False,
+                    'event_idx': skel['event_idx'],
+                    'event_type': skel['event_type'],
+                    'location': skel['location'],
+                    'plan_time': self._format_event_time(skel.get('plan_time')),
+                    'event_time': self._format_event_time(skel.get('event_time')),
+                    'predicted_time': None,
+                    'context': skel.get('context', {}),
+                }
+                
+                if i > 0:
+                    prev_skel = original_skeleton[i-1]
+                    if prev_skel.get('neptune_matched', False):
+                        prev_actual_time = prev_skel.get('event_time')
+                        curr_actual_time = skel.get('event_time')
+                        if prev_actual_time and curr_actual_time:
+                            prev_dt = self._parse_event_time(prev_actual_time)
+                            curr_dt = self._parse_event_time(curr_actual_time)
+                            if prev_dt and curr_dt:
+                                actual_hours = (curr_dt - prev_dt).total_seconds() / 3600.0
+                                event_output['actual_hours'] = actual_hours
+                
+                output_events.append(event_output)
+            
+            predicted_event_output = {
+                'is_predicted': True,
+                'event_idx': target_skel['event_idx'],
+                'event_type': target_skel['event_type'],
+                'location': target_skel['location'],
+                'plan_time': self._format_event_time(target_skel.get('plan_time')),
+                'event_time': None,
+                'predicted_time': self._format_event_time(predicted_dt),
+                'predicted_hours': pred_hours,
+                'context': target_skel.get('context', {}),
+            }
+            output_events.append(predicted_event_output)
+            
             has_any_problem = any(
                 e.get('context', {}).get('has_problem', False) 
                 for e in output_events
@@ -958,52 +823,48 @@ class EventTimeInference:
                 if e.get('context', {}).get('has_problem', False)
             ]
             
+            remaining_events = len(filled_skeleton) - next_event_idx - 1
+            
             result = {
-                'package_id': package_id,
-                'status': 'success',
+                'tracking_id': package_id,
+                'status': 'in_transit',
                 'delivery_status': delivery_status,
                 'num_events': len(output_events),
                 'actual_events': actual_event_count,
-                'predicted_events': predicted_event_count,
+                'predicted_events': 1,
+                'next_event_idx': next_event_idx,
+                'remaining_events_after_next': remaining_events,
                 'source_postal': package_data.get('source_postal'),
                 'dest_postal': dest_postal,
                 'pdd': self._format_event_time(package_data.get('pdd')),
-                'eta': eta,
+                'next_event_prediction': {
+                    'event_idx': next_event_idx,
+                    'event_type': target_skel['event_type'],
+                    'location': target_skel['location'],
+                    'predicted_time': self._format_event_time(predicted_dt),
+                    'predicted_hours_from_previous': pred_hours,
+                    'previous_event_time': self._format_event_time(prev_event_time),
+                },
+                'eta': None,
                 'has_problems': has_any_problem,
                 'problem_event_indices': problem_events if problem_events else None,
                 'last_known_location': last_known_location,
                 'events': output_events,
                 'metrics': {
-                    'mae': float(np.mean(all_ae)) if all_ae else None,
-                    'max_ae': float(np.max(all_ae)) if all_ae else None,
-                    'min_ae': float(np.min(all_ae)) if all_ae else None,
-                    'total_predicted_hours': float(np.sum(valid_preds)) if valid_preds else None,
-                    'total_actual_hours': float(np.sum(valid_actuals)) if valid_actuals else None,
+                    'mae': None,
+                    'max_ae': None,
+                    'min_ae': None,
+                    'total_predicted_hours': pred_hours,
+                    'total_actual_hours': None,
                 }
             }
-            
-            if (result['metrics']['total_predicted_hours'] is not None and 
-                result['metrics']['total_actual_hours'] is not None):
-                result['metrics']['total_time_ae'] = abs(
-                    result['metrics']['total_predicted_hours'] - 
-                    result['metrics']['total_actual_hours']
-                )
-            
-            # Calculate remaining time for in-transit packages
-            if delivery_status == 'IN_TRANSIT':
-                remaining_preds = [
-                    e['predicted_hours'] for e in output_events 
-                    if e.get('is_predicted', False) and e.get('predicted_hours') is not None
-                ]
-                if remaining_preds:
-                    result['remaining_hours'] = float(np.sum(remaining_preds))
             
             return result
             
         except Exception as e:
             import traceback
             return {
-                'package_id': package_id,
+                'tracking_id': package_id,
                 'status': 'error',
                 'error': str(e),
                 'traceback': traceback.format_exc(),
@@ -1011,11 +872,32 @@ class EventTimeInference:
             }
     
     @torch.no_grad()
+    def predict_single(self, package_id: str, package_data: Optional[Dict] = None) -> Dict:
+        if package_data is None:
+            package_data = self.fetch_package(package_id)
+        
+        if package_data is None:
+            return {
+                'tracking_id': package_id,
+                'status': 'error',
+                'error': 'Package not found or invalid'
+            }
+        
+        # Check if already delivered - return simple response and skip prediction
+        if self._check_if_delivered(package_data):
+            return {
+                'tracking_id': package_id,
+                'status': 'delivered'
+            }
+        
+        # Not delivered - run prediction
+        return self.predict_next_event(package_id, package_data)
+    
+    @torch.no_grad()
     def predict_batch(self, package_ids: List[str]) -> List[Dict]:
-        """Predict event times for multiple packages."""
         results = []
         
-        print(f"Fetching {len(package_ids)} packages from Neptune...")
+        print(f"Fetching {len(package_ids)} packages from Neptune...", flush=True)
         package_data_map = {}
         
         for pkg_id in tqdm(package_ids, desc="Fetching packages"):
@@ -1024,70 +906,86 @@ class EventTimeInference:
                 package_data_map[pkg_id] = package_data
             else:
                 results.append({
-                    'package_id': pkg_id,
+                    'tracking_id': pkg_id,
                     'status': 'error',
                     'error': 'Package not found or invalid'
                 })
         
-        print(f"Successfully fetched {len(package_data_map)} packages")
+        print(f"Successfully fetched {len(package_data_map)} packages", flush=True)
         
-        for pkg_id in tqdm(list(package_data_map.keys()), desc="Running inference"):
-            result = self.predict_single(pkg_id, package_data_map[pkg_id])
+        # Separate delivered and non-delivered packages
+        delivered_packages = []
+        packages_to_predict = []
+        
+        for pkg_id, pkg_data in package_data_map.items():
+            if self._check_if_delivered(pkg_data):
+                delivered_packages.append(pkg_id)
+                results.append({
+                    'tracking_id': pkg_id,
+                    'status': 'delivered'
+                })
+            else:
+                packages_to_predict.append((pkg_id, pkg_data))
+        
+        print(f"Skipping {len(delivered_packages)} delivered packages", flush=True)
+        print(f"Running inference on {len(packages_to_predict)} in-transit packages", flush=True)
+        
+        for pkg_id, pkg_data in tqdm(packages_to_predict, desc="Running inference"):
+            result = self.predict_next_event(pkg_id, pkg_data)
             results.append(result)
         
         return results
     
-    def save_results(self, results: List[Dict], output_path: str):
-        """Save prediction results to local file."""
-        ext = os.path.splitext(output_path)[1].lower()
+    @torch.no_grad()
+    def predict_next_event_batch(self, package_ids: List[str]) -> List[Dict]:
+        results = []
         
-        output_dir = os.path.dirname(output_path)
-        if output_dir:
-            os.makedirs(output_dir, exist_ok=True)
+        print(f"Fetching {len(package_ids)} packages from Neptune...", flush=True)
+        package_data_map = {}
         
-        if ext == '.csv':
-            flat_results = []
-            for r in results:
-                flat = {
-                    'package_id': r['package_id'],
-                    'status': r['status'],
-                    'delivery_status': r.get('delivery_status'),
-                    'error': r.get('error'),
-                    'num_events': r.get('num_events'),
-                    'actual_events': r.get('actual_events'),
-                    'predicted_events': r.get('predicted_events'),
-                    'source_postal': r.get('source_postal'),
-                    'dest_postal': r.get('dest_postal'),
-                    'pdd': r.get('pdd'),
-                    'eta': r.get('eta'),
-                    'remaining_hours': r.get('remaining_hours'),
-                    'has_problems': r.get('has_problems'),
-                }
-                if 'metrics' in r and r['metrics']:
-                    flat.update({
-                        'mae': r['metrics'].get('mae'),
-                        'max_ae': r['metrics'].get('max_ae'),
-                        'min_ae': r['metrics'].get('min_ae'),
-                        'total_predicted_hours': r['metrics'].get('total_predicted_hours'),
-                        'total_actual_hours': r['metrics'].get('total_actual_hours'),
-                        'total_time_ae': r['metrics'].get('total_time_ae'),
-                    })
-                flat_results.append(flat)
-            pd.DataFrame(flat_results).to_csv(output_path, index=False)
-        else:
-            with open(output_path, 'w') as f:
-                json.dump(results, f, indent=2, default=str)
+        for pkg_id in tqdm(package_ids, desc="Fetching packages"):
+            package_data = self.fetch_package(pkg_id)
+            if package_data is not None:
+                package_data_map[pkg_id] = package_data
+            else:
+                results.append({
+                    'tracking_id': pkg_id,
+                    'status': 'error',
+                    'error': 'Package not found or invalid'
+                })
         
-        print(f"Results saved to: {output_path}")
+        print(f"Successfully fetched {len(package_data_map)} packages", flush=True)
+        
+        # Separate delivered and non-delivered packages
+        delivered_packages = []
+        packages_to_predict = []
+        
+        for pkg_id, pkg_data in package_data_map.items():
+            if self._check_if_delivered(pkg_data):
+                delivered_packages.append(pkg_id)
+                results.append({
+                    'tracking_id': pkg_id,
+                    'status': 'delivered'
+                })
+            else:
+                packages_to_predict.append((pkg_id, pkg_data))
+        
+        print(f"Skipping {len(delivered_packages)} delivered packages", flush=True)
+        print(f"Running inference on {len(packages_to_predict)} in-transit packages", flush=True)
+        
+        for pkg_id, pkg_data in tqdm(packages_to_predict, desc="Running next-event inference"):
+            result = self.predict_next_event(pkg_id, pkg_data)
+            results.append(result)
+        
+        return results
     
     def close(self):
-        """Clean up all resources."""
         if hasattr(self, 'extractor') and self.extractor is not None:
             try:
                 self.extractor.close()
-                print("Neptune connection closed")
+                print("Neptune connection closed", flush=True)
             except Exception as e:
-                print(f"Warning: Error closing Neptune connection: {e}")
+                print(f"Warning: Error closing Neptune connection: {e}", flush=True)
             self.extractor = None
         
         if hasattr(self, 'model') and self.model is not None:
@@ -1102,211 +1000,144 @@ class EventTimeInference:
             torch.cuda.empty_cache()
         
         gc.collect()
-        print("Resources cleaned up")
+        print("Resources cleaned up", flush=True)
 
-
-# ============================================================================
-# SUMMARY PRINTING
-# ============================================================================
 
 def print_summary(results: List[Dict]):
-    """Print summary statistics."""
-    successful = [r for r in results if r['status'] == 'success']
-    failed = [r for r in results if r['status'] == 'error']
     
-    print("\n" + "=" * 80)
-    print("INFERENCE RESULTS SUMMARY")
-    print("=" * 80)
+    def format_time(t):
+        if t is None:
+            return 'N/A'
+        if isinstance(t, datetime):
+            return t.strftime('%Y-%m-%d %H:%M')
+        if isinstance(t, str):
+            return t[:16].replace('T', ' ')
+        return 'N/A'
     
-    print(f"\nPackages: {len(results)} total | {len(successful)} success | {len(failed)} failed")
+    # Categorize results
+    delivered = [r for r in results if r.get('status') == 'delivered']
+    in_transit = [r for r in results if r.get('status') == 'in_transit']
+    failed = [r for r in results if r.get('status') == 'error']
     
-    delivered = [r for r in successful if r.get('delivery_status') == 'DELIVERED']
-    in_transit = [r for r in successful if r.get('delivery_status') == 'IN_TRANSIT']
+    print("\n" + "=" * 80, flush=True)
+    print("INFERENCE RESULTS SUMMARY", flush=True)
+    print("=" * 80, flush=True)
     
-    print(f"\nDelivery Status:")
-    print(f"  DELIVERED:  {len(delivered)}")
-    print(f"  IN_TRANSIT: {len(in_transit)}")
+    print(f"\nPackages: {len(results)} total", flush=True)
+    print(f"  DELIVERED (skipped):  {len(delivered)}", flush=True)
+    print(f"  IN_TRANSIT (predicted): {len(in_transit)}", flush=True)
+    print(f"  ERROR: {len(failed)}", flush=True)
     
-    packages_with_problems = [r for r in successful if r.get('has_problems', False)]
-    if packages_with_problems:
-        print(f"\nPackages with problems: {len(packages_with_problems)}")
+    if delivered:
+        print(f"\n{'─' * 80}", flush=True)
+        print("DELIVERED PACKAGES (Skipped - No Prediction Needed)", flush=True)
+        print(f"{'─' * 80}", flush=True)
+        for r in delivered:
+            print(f"  ✓ {r['tracking_id']}: delivered", flush=True)
     
     if failed:
-        print(f"\nFailed Packages:")
+        print(f"\n{'─' * 80}", flush=True)
+        print("FAILED PACKAGES", flush=True)
+        print(f"{'─' * 80}", flush=True)
         for r in failed:
             error_msg = r.get('error', 'Unknown')
-            if len(error_msg) > 80:
-                error_msg = error_msg[:80] + "..."
-            print(f"  ✗ {r['package_id']}: {error_msg}")
-    
-    if not successful:
-        print("\nNo successful predictions to summarize.")
-        return
-    
-    delivered_with_metrics = [r for r in delivered if r['metrics'].get('mae') is not None]
-    
-    all_mae = [r['metrics']['mae'] for r in delivered_with_metrics]
-    all_total_ae = [r['metrics']['total_time_ae'] for r in delivered_with_metrics if r['metrics'].get('total_time_ae') is not None]
-    all_total_pred = [r['metrics']['total_predicted_hours'] for r in delivered_with_metrics if r['metrics'].get('total_predicted_hours') is not None]
-    all_total_actual = [r['metrics']['total_actual_hours'] for r in delivered_with_metrics if r['metrics'].get('total_actual_hours') is not None]
-    
-    print(f"\n{'─' * 80}")
-    print("AGGREGATE METRICS (DELIVERED packages only)")
-    print(f"{'─' * 80}")
-    
-    if all_mae:
-        print(f"\nPer-Event Absolute Error (hours):")
-        print(f"  Mean MAE:   {np.mean(all_mae):.2f}")
-        print(f"  Std MAE:    {np.std(all_mae):.2f}")
-        print(f"  Min MAE:    {np.min(all_mae):.2f}")
-        print(f"  Max MAE:    {np.max(all_mae):.2f}")
-    
-    if all_total_ae:
-        print(f"\nTotal Journey Time Error (hours):")
-        print(f"  Mean:       {np.mean(all_total_ae):.2f}")
-        print(f"  Std:        {np.std(all_total_ae):.2f}")
-        print(f"  Min:        {np.min(all_total_ae):.2f}")
-        print(f"  Max:        {np.max(all_total_ae):.2f}")
-    
-    if all_total_pred and all_total_actual:
-        print(f"\nTotal Journey Time (hours):")
-        print(f"  Avg Predicted: {np.mean(all_total_pred):.2f}")
-        print(f"  Avg Actual:    {np.mean(all_total_actual):.2f}")
+            if len(error_msg) > 60:
+                error_msg = error_msg[:60] + "..."
+            print(f"  ✗ {r['tracking_id']}: {error_msg}", flush=True)
     
     if in_transit:
-        print(f"\n{'─' * 80}")
-        print("IN-TRANSIT PACKAGES - ETA PREDICTIONS")
-        print(f"{'─' * 80}")
+        print(f"\n{'─' * 80}", flush=True)
+        print("IN-TRANSIT PACKAGES - NEXT EVENT PREDICTIONS", flush=True)
+        print(f"{'─' * 80}", flush=True)
         
-        remaining_hours = [r.get('remaining_hours') for r in in_transit if r.get('remaining_hours') is not None]
-        if remaining_hours:
-            print(f"\nRemaining Time (hours):")
-            print(f"  Avg:  {np.mean(remaining_hours):.2f}")
-            print(f"  Min:  {np.min(remaining_hours):.2f}")
-            print(f"  Max:  {np.max(remaining_hours):.2f}")
-    
-    print(f"\n{'─' * 80}")
-    print("PER-PACKAGE SUMMARY")
-    print(f"{'─' * 80}")
-    print(f"{'Package ID':<25} {'Status':<12} {'Total':<6} {'Act':<5} {'Pred':<5} {'MAE(h)':<8} {'ETA/Remaining':<20}")
-    print(f"{'-'*25} {'-'*12} {'-'*6} {'-'*5} {'-'*5} {'-'*8} {'-'*20}")
-    
-    for r in successful:
-        m = r['metrics']
-        mae_str = f"{m['mae']:.2f}" if m.get('mae') is not None else "N/A"
+        print(f"\n{'Tracking ID':<20} {'Last Event':<12} {'Next Event':<12} {'Pred Time':<20} {'Pred(h)':<10}", flush=True)
+        print(f"{'-'*20} {'-'*12} {'-'*12} {'-'*20} {'-'*10}", flush=True)
         
-        delivery_status = r.get('delivery_status', 'UNKNOWN')
+        for r in in_transit:
+            last_loc = r.get('last_known_location', {})
+            last_event_type = last_loc.get('event_type', 'N/A')[:12] if last_loc else 'N/A'
+            
+            next_pred = r.get('next_event_prediction', {})
+            next_event_type = next_pred.get('event_type', 'N/A')[:12] if next_pred else 'N/A'
+            
+            pred_time_str = format_time(next_pred.get('predicted_time')) if next_pred else 'N/A'
+            
+            pred_hours = next_pred.get('predicted_hours_from_previous') if next_pred else None
+            pred_hours_str = f"{pred_hours:.2f}" if pred_hours is not None else 'N/A'
+            
+            print(f"{r['tracking_id']:<20} {last_event_type:<12} {next_event_type:<12} {pred_time_str:<20} {pred_hours_str:<10}", flush=True)
         
-        if delivery_status == 'IN_TRANSIT':
-            eta = r.get('eta', '')
-            remaining = r.get('remaining_hours')
-            if eta:
-                eta_str = eta[:16].replace('T', ' ')
-                if remaining:
-                    eta_str += f" ({remaining:.1f}h)"
-            elif remaining:
-                eta_str = f"~{remaining:.1f}h remaining"
-            else:
-                eta_str = "N/A"
-        else:
-            eta_str = "DELIVERED"
+        # Detailed view for in-transit packages
+        print(f"\n{'─' * 80}", flush=True)
+        print("IN-TRANSIT DETAILED EVENT VIEW", flush=True)
+        print(f"{'─' * 80}", flush=True)
         
-        print(f"{r['package_id']:<25} {delivery_status:<12} {r['num_events']:<6} {r.get('actual_events', '-'):<5} {r.get('predicted_events', '-'):<5} {mae_str:<8} {eta_str:<20}")
-    
-    print(f"\n{'─' * 80}")
-    print("EVENT-LEVEL DETAILS")
-    print(f"{'─' * 80}")
-    
-    for r in successful:
-        status_indicator = f"[{r.get('delivery_status', 'UNKNOWN')}]"
-        problem_indicator = " ⚠️ HAS PROBLEMS" if r.get('has_problems', False) else ""
-        
-        print(f"\n{r['package_id']} {status_indicator}{problem_indicator}")
-        print(f"  Events: {r['num_events']} total ({r.get('actual_events', 0)} actual, {r.get('predicted_events', 0)} predicted)")
-        
-        if r.get('delivery_status') == 'IN_TRANSIT':
+        for r in in_transit:
+            print(f"\n{'=' * 80}", flush=True)
+            print(f"{r['tracking_id']} [IN_TRANSIT]", flush=True)
+            print(f"{'=' * 80}", flush=True)
+            
+            print(f"  Source: {r.get('source_postal', 'N/A')} → Dest: {r.get('dest_postal', 'N/A')}", flush=True)
+            print(f"  PDD: {format_time(r.get('pdd'))}", flush=True)
+            print(f"  Events shown: {r.get('num_events', 0)} ({r.get('actual_events', 0)} actual + 1 predicted)", flush=True)
+            print(f"  Remaining after next: {r.get('remaining_events_after_next', 'N/A')} events", flush=True)
+            
             last_loc = r.get('last_known_location', {})
             if last_loc:
-                print(f"  Last Known: {last_loc.get('event_type')} at {last_loc.get('location')}")
-            if r.get('eta'):
-                print(f"  ETA: {r.get('eta')[:19].replace('T', ' ')} (in {r.get('remaining_hours', 0):.1f}h)")
-            elif r.get('remaining_hours'):
-                print(f"  Remaining: ~{r.get('remaining_hours'):.1f}h")
-        
-        print(f"\n  {'#':<3} {'Type':<10} {'Location':<8} {'Status':<6} {'Plan Time':<20} {'Event Time':<20} {'Pred Time':<20} {'Pred(h)':<8} {'Act(h)':<8} {'AE(h)':<8}")
-        print(f"  {'-'*3} {'-'*10} {'-'*8} {'-'*6} {'-'*20} {'-'*20} {'-'*20} {'-'*8} {'-'*8} {'-'*8}")
-        
-        for event in r['events']:
-            pred_h_str = f"{event['predicted_hours']:.2f}" if event.get('predicted_hours') is not None else ""
-            actual_h_str = f"{event['actual_hours']:.2f}" if event.get('actual_hours') is not None else ""
-            ae_str = f"{event['ae']:.2f}" if event.get('ae') is not None else ""
+                last_time_str = format_time(last_loc.get('event_time'))
+                print(f"  Last Known: {last_loc.get('event_type')} at {last_loc.get('location')} ({last_time_str})", flush=True)
             
-            loc = str(event.get('location', 'N/A'))[:8]
-            event_type = str(event.get('event_type', 'N/A'))[:10]
+            next_pred = r.get('next_event_prediction', {})
+            if next_pred:
+                pred_time_str = format_time(next_pred.get('predicted_time'))
+                prev_time_str = format_time(next_pred.get('previous_event_time'))
+                pred_h = next_pred.get('predicted_hours_from_previous')
+                pred_h_str = f"{pred_h:.2f}h" if pred_h is not None else 'N/A'
+                
+                print(f"\n  >>> NEXT EVENT PREDICTION <<<", flush=True)
+                print(f"      Event: {next_pred.get('event_type')} at {next_pred.get('location')}", flush=True)
+                print(f"      Previous Event Time: {prev_time_str}", flush=True)
+                print(f"      Predicted Time: {pred_time_str}", flush=True)
+                print(f"      Time from Previous: {pred_h_str}", flush=True)
             
-            is_predicted = event.get('is_predicted', False)
-            status = "PRED" if is_predicted else "ACT"
-            
-            # Plan time
-            plan_time = event.get('plan_time', '')
-            if plan_time:
-                plan_time_str = plan_time[:16].replace('T', ' ')
-            else:
-                plan_time_str = ""
-            
-            # Event time (empty for predicted events)
-            event_time = event.get('event_time', '')
-            if event_time:
-                event_time_str = event_time[:16].replace('T', ' ')
-            else:
-                event_time_str = ""
-            
-            # Predicted time
-            pred_time = event.get('predicted_time', '')
-            if pred_time:
-                pred_time_str = pred_time[:16].replace('T', ' ')
-            else:
-                pred_time_str = ""
-            
-            context = event.get('context', {})
-            prefix = "  "
-            if is_predicted:
-                prefix = "→ "
-            elif context.get('has_problem', False):
-                prefix = "⚠ "
-            
-            print(f"{prefix}{event['event_idx']:<3} {event_type:<10} {loc:<8} {status:<6} {plan_time_str:<20} {event_time_str:<20} {pred_time_str:<20} {pred_h_str:<8} {actual_h_str:<8} {ae_str:<8}")
-            
-            if context.get('has_problem', False):
-                problem = context.get('problem', '')
-                if problem:
-                    print(f"      └─ Problem: {problem}")
-                if context.get('missort'):
-                    print(f"      └─ Missort: Yes")
-                if context.get('dwelling_hours'):
-                    print(f"      └─ Dwelling: {context['dwelling_hours']}h")
+            events = r.get('events', [])
+            if events:
+                print(f"\n  {'#':<3} {'Type':<10} {'Location':<8} {'Status':<6} {'Plan Time':<20} {'Event Time':<20} {'Pred Time':<20}", flush=True)
+                print(f"  {'-'*3} {'-'*10} {'-'*8} {'-'*6} {'-'*20} {'-'*20} {'-'*20}", flush=True)
+                
+                for event in events:
+                    is_predicted = event.get('is_predicted', False)
+                    status = "PRED" if is_predicted else "ACT"
+                    
+                    plan_time_str = format_time(event.get('plan_time'))
+                    event_time_str = format_time(event.get('event_time'))
+                    pred_time_str = format_time(event.get('predicted_time'))
+                    
+                    loc = str(event.get('location', 'N/A'))[:8]
+                    event_type = str(event.get('event_type', 'N/A'))[:10]
+                    
+                    prefix = "→ " if is_predicted else "  "
+                    
+                    print(f"{prefix}{event.get('event_idx', 0):<3} {event_type:<10} {loc:<8} {status:<6} {plan_time_str:<20} {event_time_str:<20} {pred_time_str:<20}", flush=True)
+    
+    print(f"\n{'=' * 80}", flush=True)
+    print("END OF RESULTS", flush=True)
+    print(f"{'=' * 80}", flush=True)
 
-
-# ============================================================================
-# MAIN
-# ============================================================================
 
 def main():
-    """Main entry point."""
-    
-    print("=" * 80)
-    print("EVENT TIME PREDICTION - ITERATIVE ROLLING PREDICTIONS")
-    print("With plan_time for each event")
-    print("=" * 80)
-    print(f"\nPackages to process: {len(PACKAGE_IDS)}")
+    print("=" * 80, flush=True)
+    print("EVENT TIME PREDICTION - NEXT EVENT PREDICTION", flush=True)
+    print("=" * 80, flush=True)
+    print(f"\nPackages to process: {len(PACKAGE_IDS)}", flush=True)
     for pkg_id in PACKAGE_IDS:
-        print(f"  - {pkg_id}")
-    print(f"\nCheckpoint: {CHECKPOINT_PATH}")
-    print(f"Preprocessor: {PREPROCESSOR_PATH}")
-    print(f"Output: {OUTPUT_PATH}")
-    print(f"Strict validation: {STRICT_LEG_PLAN_VALIDATION}")
-    print(f"Allow undelivered: {ALLOW_UNDELIVERED}")
-    print("=" * 80)
+        print(f"  - {pkg_id}", flush=True)
+    print(f"\nCheckpoint: {CHECKPOINT_PATH}", flush=True)
+    print(f"Preprocessor: {PREPROCESSOR_PATH}", flush=True)
+    print(f"Output: {OUTPUT_PATH}", flush=True)
+    print(f"Strict validation: {STRICT_LEG_PLAN_VALIDATION}", flush=True)
+    print(f"Allow undelivered: {ALLOW_UNDELIVERED}", flush=True)
+    print("=" * 80, flush=True)
     
     inference = None
     exit_code = 0
@@ -1326,20 +1157,22 @@ def main():
         print_summary(results)
         
         if OUTPUT_PATH:
-            inference.save_results(results, OUTPUT_PATH)
+            with open(OUTPUT_PATH, 'w') as f:
+                json.dump(results, f, indent=2, default=str)
+            print(f"\nResults saved to: {OUTPUT_PATH}", flush=True)
         
-        print("\n" + "=" * 80)
-        print("✓ INFERENCE COMPLETE")
-        print("=" * 80)
+        print("\n" + "=" * 80, flush=True)
+        print("✓ INFERENCE COMPLETE", flush=True)
+        print("=" * 80, flush=True)
         
     except FileNotFoundError as e:
-        print(f"\n❌ File not found: {e}")
+        print(f"\n❌ File not found: {e}", flush=True)
         exit_code = 1
     except KeyboardInterrupt:
-        print("\n\n⚠️ Interrupted by user")
+        print("\n\n⚠️ Interrupted by user", flush=True)
         exit_code = 1
     except Exception as e:
-        print(f"\n❌ Error: {e}")
+        print(f"\n❌ Error: {e}", flush=True)
         import traceback
         traceback.print_exc()
         exit_code = 1
